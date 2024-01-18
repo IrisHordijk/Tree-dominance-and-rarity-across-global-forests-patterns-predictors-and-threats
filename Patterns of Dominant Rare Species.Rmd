@@ -1,0 +1,1531 @@
+---
+title: "Patterns, drivers and threats to dominant and rare tree species"
+author: "Iris Hordijk"
+date: "8/11/2021"
+output: html_document
+---
+###Load packages
+```{r Packages}
+library(datasets)
+library(data.table)
+library(xlsx)
+library(feather)
+library(tidyr)
+library(tidyverse)
+library(stringr)
+library(car)
+library(dunn.test)
+library(varImp)
+library(caret)
+library(randomForest)
+library(ggplot2)
+library(gridExtra)
+library(plotrix)
+library(dplyr)
+```
+###Load data
+```{r Data}
+setwd("/Volumes/usys_ibz_cr_lab/")
+GFBI <- read_feather("/Volumes/usys_ibz_cr_lab/GFBI_Data/tree_data/GFBI_fixed_plots.feather") #plots: 1184025
+```
+###Filter data for 1)plotsize 2)measurement year 3)Forest biome 4)DBH treshold
+```{r Data}
+### 1)Filter plotsize
+GFBI$Plotsize <- 1/GFBI$tph
+GFBI_Filter_Ps <- GFBI[which(GFBI$Plotsize > 0.02 & GFBI$Plotsize < 2),]
+GFBI_Filter_Ps <- as.data.frame(GFBI_Filter_Ps)
+
+#table(is.na(GFBI_Filter_Ps$Plotsize)) #No na values
+table(is.infinite(GFBI_Filter_Ps$Plotsize)) #Throw infinite numbers out, as their plotsize is close or equal to zero
+GFBI_Filter_PsInf <-GFBI_Filter_Ps[!is.infinite(GFBI_Filter_Ps$Plotsize),]
+table(is.infinite(GFBI_Filter_PsInf$Plotsize)) #Check
+
+#unique(GFBI_Filter_PsInf$plot_id) #plots: 1085705
+#100-((1085705/1184025)*100) #Percentage of plots filtered out: 8.3%
+
+### 2)Filter measurement year
+GFBI_Filter_Yr <- GFBI_Filter_PsInf[which(GFBI_Filter_PsInf$year > 1989),]
+unique(GFBI_Filter_Yr$plot_id) #plots: 858315
+100-((858315/1085705)*100) #Percentage of plots filtered out: 21%
+
+###Check if there are multiple measurement years per plot
+GFBI_Filter_YrCheck <- GFBI_Filter_Yr %>% group_by(plot_id) %>% filter(year == max(year))
+
+###3) Filter forest biomes
+#Create coordinates for extraction Biome and Forest age info GEE
+GFBI_plot <- GFBI_Filter_YrCheck %>% group_by(plot_id) %>% slice(1)
+# TraitsGFBI_coordinates <- subset(GFBI_plot, select=c(lat, lon, plot_id))
+# setwd("~/Documents/PhD projects/Traits Dominant Species")
+# fwrite(TraitsGFBI_coordinates, file="Trait_coordinates_05-2021.csv") #Create coordinates to export to GEE
+
+rm(GFBI_Filter_Ps, GFBI_Filter_PsInf) #Clean-up workspace
+
+###Import and add GEE information
+setwd("~/Documents/PhD projects/Traits Dominant Species/Traits03-05-2021")
+GEE <- list.files("~/Documents/PhD projects/Traits Dominant Species/Traits03-05-2021") %>% map_df(~fread(.))
+GEE <- as.data.frame(GEE)
+GFBI_GEE <- left_join(GFBI_plot, GEE, by="plot_id")
+
+setnames(GFBI_GEE, old=c("system:index"), new=c("systemindex"))
+GFBI_GEE <- subset(GFBI_GEE, select=-c(.geo, random, systemindex, old_plot_id, Pixel_Lat, Pixel_Long))
+
+GFBI_filter_Biome <- GFBI_GEE[which(GFBI_GEE$Resolve_Biome < 7), ]
+
+###4) Filter DBH
+GFBI_filter_DBH <- GFBI_Filter_YrCheck[which(GFBI_Filter_YrCheck$dbh >= 5), ] #Filter DBH <5cm uit
+
+###Merge filtered plots and tree-level data
+GFBI_join <- semi_join(GFBI_filter_DBH, GFBI_filter_Biome, by="plot_id")
+
+###Add biome information
+Biome <- subset(GFBI_filter_Biome, select=c(plot_id, Resolve_Biome))
+GFBI_Biome <- left_join(GFBI_join, Biome, by="plot_id")
+
+setwd("~/Documents/PhD projects/Map of evenness")
+fwrite(GFBI_Biome, file="GFBI_Filtered_Biome.csv")
+
+rm(list=setdiff(ls(), "GFBI_Biome"))
+
+GFBI_Biome <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Filtered_Biome.csv") #671157
+unique(GFBI_Biome$plot_id)
+summary(GFBI_Biome$year)
+mean(GFBI_Biome$year)
+
+```
+###Standardise species names
+```{r Standardise species names}
+###Standardize species names with tree plant list & GBIF
+GFBI_Biome <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Filtered_Biome.csv")
+Species_names <- read_feather("/Volumes/usys_ibz_cr_lab/GFBI_Data/tree_data/BEST_MATCH_all_species_TPL.feather")
+
+GFBI_Species <- left_join(GFBI_Biome, Species_names, by="raw_name") #table(GFBI_Species$match_source) #(186897/13133048)*100 #1.4% tree individuals species identified with GBIF
+
+#Only keep species which are identified up to species level
+GFBI_Species <- GFBI_Species[which(GFBI_Species$tax_level == "2"),] # 1.7% of trees is only identified up to genus level #100-(12907085/13133048)*100
+setnames(GFBI_Species, old=c("accepted_bin", "Resolve_Biome"), new=c("species_name", "Biome"))
+GFBI_Species <- subset(GFBI_Species, select=-c(raw_name, old_plot_id, match_source, tax_genus, tax_species, tax_level))
+
+setwd("~/Documents/PhD projects/Map of evenness")
+fwrite(GFBI_Species, file="GFBI_Biome_Species.csv")
+
+rm(list=setdiff(ls(), "GFBI_Species"))
+
+GFBI_Species <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Biome_Species.csv") 
+unique(GFBI_Species$species_name)
+names(GFBI_Species)
+```
+
+###Calculate number of species, dominance and rarity per plot
+```{r Calculations}
+GFBI_Biome_Species <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Biome_Species.csv")
+GFBI_Biome_Species <- GFBI_Species
+
+#Calculate BA per individual (m2 per ha)
+BA_ind <- GFBI_Biome_Species %>% group_by(obs_id) %>% mutate(BA_ind = (pi*(dbh^2)/40000)/Plotsize)
+BA_ind$NrInd <- 1
+
+#Sum BA per species (m2 per ha)
+BA_spp <- BA_ind %>% group_by(plot_id, species_name) %>% summarise(BA_sp = sum(BA_ind), IndPerSp=sum(NrInd), Biome=mean(Biome))
+
+#Calculate sum BA per per plot (m2 per ha)
+BA_total <- BA_spp %>% group_by(plot_id) %>% mutate(BA_plot = sum(BA_sp))
+
+#Calculate relative BA per species
+BA_perc <- BA_total %>% group_by(plot_id, species_name) %>% mutate(BA_perc_sp = (BA_sp/BA_plot)*100) 
+BA_perc_sum <- BA_perc %>% group_by(plot_id) %>% arrange(BA_perc_sp) %>% mutate(BA_cumsum = cumsum(BA_perc_sp))
+
+#Calculate rarity
+BA_rare <- BA_perc_sum %>% group_by(plot_id) %>% mutate(Rare = sum(BA_cumsum < 10), S=n()) #Number of species making up last 10% of BA divided by the total number of species
+BA_rare$Rarity <- (BA_rare$Rare/BA_rare$S)*100
+BA_rare <- as.data.frame(BA_rare)
+
+setwd("~/Documents/PhD projects/Map of evenness")
+fwrite(BA_rare, file="DominanceRarity11-08-2021.csv")
+
+rm(list=setdiff(ls(), "BA_rare"))
+```
+###Fig. 1 Location GFBI Plots
+```{r Map Locations}
+#Mapping
+library(raster)
+library(sp)
+library(maps)
+library(ggmap)
+library(maptools)
+library(rgdal)
+library(ggalt)
+
+GFBI_Species <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Biome_Species.csv")
+
+#load map
+world <- map_data("world")
+map <- ggplot() + geom_map(data=world, map=world, (aes(x=long, y=lat, map_id = region)),color=NA,fill="grey80")
+map <- map + theme(panel.background = element_rect(fill = "white", colour=NA),panel.grid.major = element_line(colour = NA, size=0.01),panel.grid.minor = element_line(colour = NA, size=0.01))
+
+#plot data points on map
+map <- map + geom_point(data=GFBI_Species, aes(x=lon, y=lat, colour = factor(Biome)),size=1,stroke=0,shape=15)+
+  scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) +
+  theme(plot.title = element_blank(),
+        legend.position = "none",
+        axis.text.x = element_blank(), 
+        axis.text.y = element_blank(),
+        axis.title.x = element_blank(),
+        axis.title.y = element_blank(),
+        axis.ticks = element_blank()) + ylim(-55,80) 
+
+```
+
+###Calculation Table fig 1:N, S, Monodominance & Singletons
+```{r Table Fig. 1}
+
+DominanceRarity <- fread("~/Documents/PhD projects/Map of evenness/DominanceRarity11-08-2021.csv")
+DominanceRarity <- BA_rare
+
+N <- DominanceRarity %>% group_by(Biome, plot_id) %>% slice(1) %>% ungroup() %>% group_by(Biome) %>% summarise(N=n())
+S <- DominanceRarity %>% group_by(Biome) %>% summarise(S=mean(S))
+
+Monodominant <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_perc_sp == max(BA_perc_sp)) 
+Monodominant_result <- Monodominant %>% group_by(Biome) %>% filter(BA_perc_sp >= 60) %>% summarise(N_Mono=n())
+Monodominant_final_result <- (Monodominant_result$N_Mono/N$N)*100
+
+Monodominant_sp <- Monodominant %>% group_by(Biome) %>% filter(BA_perc_sp >= 60)
+Monodominant_species <- Monodominant_sp %>% group_by(Biome, species_name) %>% summarise(CountSp = n()) 
+Monodominant_species_analyse <-  Monodominant_species %>% group_by(Biome) %>% arrange(desc(CountSp)) %>% slice_head(n = 10) %>% as.data.frame()
+
+Monospecific <- Monodominant %>% group_by(Biome) %>% filter(BA_perc_sp == 100) %>% summarise(N_Monospec=n())
+Monospecific_result <- (Monospecific$N_Monospec/N$N)*100
+
+Singletons <- DominanceRarity %>% group_by(plot_id) %>% filter(IndPerSp == 1) %>% slice(1)
+Singletons_result <- Singletons %>% group_by(Biome) %>% summarise(N_single=n()) 
+Singletons_final_results <- (Singletons_result$N_single/N$N)*100
+
+Singletons_count <- DominanceRarity %>% group_by(Biome, plot_id) %>% filter(IndPerSp == 1) %>% summarise(N_single=n()) %>% ungroup %>% 
+  group_by(Biome) %>% summarise(Mean_Singletons=mean(N_single))
+```
+###Relationship Plotsize-S-Dominance-Rarity
+```{r Relationship}
+DominanceRarity <- fread("~/Documents/PhD projects/Map of evenness/DominanceRarity11-08-2021.csv")
+DominanceRarity_plot <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_perc_sp == max(BA_perc_sp))
+
+DominanceRarity_plot_Select <- DominanceRarity_plot[which(DominanceRarity_plot$Rarity>0),]
+cor.test(DominanceRarity_plot_Select$BA_perc_sp, DominanceRarity_plot_Select$Rarity, method="pearson") #p<0.001 r=0.55
+summary(lm(BA_perc_sp~Rarity, data=DominanceRarity_plot_Select)) #r2=0.30
+
+DominanceRarity_plot$dens <- col2rgb(densCols(DominanceRarity_plot$BA_perc_sp, DominanceRarity_plot$Rarity))[1,] + 1L
+paletteForUse <- c('#d10000', '#ff6622', '#ffda21', '#33dd00', '#1133cc', '#220066', '#330044')
+colors <-  colorRampPalette(paletteForUse)(256)
+DominanceRarity_plot$colors = colors[DominanceRarity_plot$dens]
+FigS3A <- ggplot(DominanceRarity_plot, aes(x=BA_perc_sp, y=Rarity)) + geom_point(color = DominanceRarity_plot$colors) + geom_smooth(method="lm", colour="black") + labs(title = "Relationship Dominance and Rarity", subtitle = "All plots included") + xlab("Dominance") + ylab("Rarity") + theme_classic()
+
+DominanceRarity_plot_Select$dens <- col2rgb(densCols(DominanceRarity_plot_Select$BA_perc_sp, DominanceRarity_plot_Select$Rarity))[1,] + 1L
+paletteForUse <- c('#d10000', '#ff6622', '#ffda21', '#33dd00', '#1133cc', '#220066', '#330044')
+colors <-  colorRampPalette(paletteForUse)(256)
+DominanceRarity_plot_Select$colors = colors[DominanceRarity_plot_Select$dens]
+FigS3B <- ggplot(DominanceRarity_plot_Select, aes(x=BA_perc_sp, y=Rarity)) + geom_point(color = DominanceRarity_plot_Select$colors) + geom_smooth(method="lm", colour="black") + labs(title = "Relationship Dominance and Rarity", subtitle = "Including only plots with rare species") + xlab("Dominance") + ylab("Rarity") + theme_classic()
+
+DominanceRarity_plot$dens <- col2rgb(densCols(log(DominanceRarity_plot$S), DominanceRarity_plot$Rarity))[1,] + 1L
+paletteForUse <- c('#d10000', '#ff6622', '#ffda21', '#33dd00', '#1133cc', '#220066', '#330044')
+colors <-  colorRampPalette(paletteForUse)(256)
+DominanceRarity_plot$colors = colors[DominanceRarity_plot$dens]
+FigS3C <- ggplot(DominanceRarity_plot, aes(x=log(S), y=Rarity)) + geom_point(color = DominanceRarity_plot$colors) + geom_smooth(method="lm", colour="black") + labs(title = "Relationship Richness and Rarity", subtitle = "All plots included") + xlab("log(Richness)") + ylab("Rarity") + theme_classic()
+
+DominanceRarity_plot_Select$dens <- col2rgb(densCols(log(DominanceRarity_plot_Select$S), DominanceRarity_plot_Select$Rarity))[1,] + 1L
+paletteForUse <- c('#d10000', '#ff6622', '#ffda21', '#33dd00', '#1133cc', '#220066', '#330044')
+colors <-  colorRampPalette(paletteForUse)(256)
+DominanceRarity_plot_Select$colors = colors[DominanceRarity_plot_Select$dens]
+FigS3D <- ggplot(DominanceRarity_plot_Select, aes(x=log(S), y=Rarity)) + geom_point(color = DominanceRarity_plot_Select$colors) + geom_smooth(method="lm", colour="black") + labs(title = "Relationship Richness and Rarity", subtitle = "Including only plots with rare species") + xlab("log(Richness)") + ylab("Rarity") + theme_classic()
+
+grid.arrange(FigS3A, FigS3B, FigS3C, FigS3D, nrow=2)
+
+cor.test(DominanceRarity_plot$Rarity, log(DominanceRarity_plot$S)) #p<0.001, r=0.61
+summary(lm(Rarity~log(S), data=DominanceRarity_plot)) #r2=0.37
+
+cor.test(DominanceRarity_plot$BA_perc_sp, log(DominanceRarity_plot$S)) #p<0.001, r=-0.82
+summary(lm(BA_perc_sp~log(S), data=DominanceRarity_plot)) #r2=0.67
+
+GFBI_Species <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Biome_Species.csv")
+GFBI_Species <- GFBI_Species %>% group_by(plot_id) %>% slice(1) %>% as.data.frame()
+
+Plotsize <- GFBI_Species[, c("plot_id", "Plotsize")] 
+GFBI_Plotsize <- inner_join(DominanceRarity_plot, Plotsize, by="plot_id")
+
+cor.test(GFBI_Plotsize$Rarity, log(GFBI_Plotsize$Plotsize), method="pearson") #p<0.001, r=0.20
+summary(lm(Rarity~log(Plotsize), data=GFBI_Plotsize))
+
+cor.test(GFBI_Plotsize$BA_perc_sp, log(GFBI_Plotsize$Plotsize), method="pearson") #p<0.001, r=0.-16
+summary(lm(BA_perc_sp~log(Plotsize), data=GFBI_Plotsize))
+
+# DominanceRarity_plot$dens <- col2rgb(densCols(log(DominanceRarity_plot$S), DominanceRarity_plot$Rarity))[1,] + 1L
+# paletteForUse <- c('#d10000', '#ff6622', '#ffda21', '#33dd00', '#1133cc', '#220066', '#330044')
+# colors <-  colorRampPalette(paletteForUse)(256)
+# DominanceRarity_plot$colors = colors[DominanceRarity_plot$dens]
+# Scatterplot <- ggplot(data=DominanceRarity_plot, aes(x=log(S), y=Rarity)) + 
+#   geom_point(color = DominanceRarity_plot$colors)
+
+```
+
+###Fig.2 Boxplots dominance and rarity by biome
+```{r Fig. 2}
+
+DominancePlot <- ggplot(data=DominanceRarity_plot, aes(x=factor(Biome), y=BA_perc_sp)) + geom_boxplot(fill = "lightgrey") + 
+  stat_boxplot(geom = 'errorbar') + theme_classic() + ylim(c(0,100)) + ggtitle("Tree Dominance") + ylab("Dominance (%)") + xlab("") +
+  theme(plot.title = element_text(color="black", size=20, face="bold", hjust = 0.5),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        axis.text.y = element_text(size = 14)) 
+
+RarityPlot <- ggplot(data=DominanceRarity_plot, aes(x=factor(Biome), y=Rarity)) + geom_boxplot(fill = "lightgrey") + 
+  stat_boxplot(geom = 'errorbar') + theme_classic() + ylim(c(0,100)) + ggtitle("Tree Rarity") + ylab("Rarity (%)") + xlab("") +
+  theme(plot.title = element_text(color="black", size=20, face="bold", hjust = 0.5),
+        axis.title.x = element_blank(),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 16),
+        axis.text.y = element_text(size = 14)) 
+
+grid.arrange(DominancePlot, RarityPlot, nrow=2)
+
+###Statistical differences between biomes
+leveneTest(DominanceRarity_plot$Rarity, DominanceRarity_plot$Biome) #Homogeneity of variances #Significant, thus kruskal wallis
+leveneTest(DominanceRarity_plot$BA_perc_sp, DominanceRarity_plot$Biome) #Homogeneity of variances #Significant, thus kruskal wallis
+
+kruskal.test(DominanceRarity_plot$Rarity, DominanceRarity_plot$Biome)
+dunn.test(DominanceRarity_plot$Rarity, DominanceRarity_plot$Biome, method='bonferroni') #all means significantly different
+
+kruskal.test(DominanceRarity_plot$BA_perc_sp, DominanceRarity_plot$Biome)
+dunn.test(DominanceRarity_plot$BA_perc_sp, DominanceRarity_plot$Biome, method='bonferroni') #all means significantly different
+```
+###Fig.3 Relationship dominance-rarity-species richness  
+```{r Relationships}
+DominanceRarity <- fread("~/Documents/PhD projects/Map of evenness/DominanceRarity11-08-2021.csv")
+DominanceRarity_plot <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_perc_sp == max(BA_perc_sp))
+DominanceRarity_plot_Select <- DominanceRarity_plot[which(DominanceRarity_plot$Rarity>0),]
+
+###Global graph
+GraphDom_rar <- ggplot(DominanceRarity_plot_Select, aes(x=BA_perc_sp, y=Rarity)) + geom_point(alpha=0.01, colour="grey") + geom_smooth(aes(color=factor(Biome)), method="lm", linewidth=2) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + theme_classic()+  ggtitle("Dominance-Rarity")+ ylab("Rarity (%)") + xlab("Dominance (%)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+GraphDom_S <- ggplot(DominanceRarity_plot, aes(x=log(S), y=BA_perc_sp)) + geom_point(alpha=0.01, colour="grey") + geom_smooth(aes(color=factor(Biome)), method="lm", linewidth=2) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + theme_classic()+  ggtitle("Species richness-Dominance")+ ylab("Dominance (%)") + xlab("log(Species richness)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+GraphRare_S <- ggplot(DominanceRarity_plot_Select, aes(x=log(S), y=Rarity)) + geom_point(alpha=0.1, colour="grey") + geom_smooth(aes(color=factor(Biome)), method="lm", linewidth=2) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + theme_classic()+  ggtitle("Species richness-Rarity")+ ylab("Rarity (%)") + xlab("log(Species richness)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "bottom",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+DRS <- grid.arrange(GraphDom_rar, GraphDom_S, GraphRare_S, ncol=3, nrow=1)
+
+```
+###Fig.4 Drivers of dominance and rarity  
+```{r Drivers}
+
+###Import and add environmental variables 
+setwd("~/Documents/PhD projects/Traits Dominant Species/Traits03-05-2021")
+GEE <- list.files("~/Documents/PhD projects/Traits Dominant Species/Traits03-05-2021") %>% map_df(~fread(.))
+
+setnames(GEE, old = c("CHELSA_BIO_Annual_Mean_Temperature", "CHELSA_BIO_Temperature_Seasonality" , "CHELSA_BIO_Annual_Precipitation", "CHELSA_BIO_Precipitation_Seasonality", "SG_Sand_Content_015cm", "SG_Soil_pH_H2O_015cm", "ConsensusLandCover_Human_Development_Percentage", "EarthEnvTopoMed_Elevation", "GFAD_FractionOfRegrowthForest_downsampled50km", "GFAD_regrowthForestAge_Mean_downsampled50km", "GHS_Population_Density"), 
+         new = c("Mean_Temperate", "Temperature_Seasonality", "Precipitation", "Precipitation_Seasonality", "Sand_Content", "Soil_pH", "Human_development", "Elevation", "Fraction_RegrowthForest", "MeanAge_RegrowthForest", "Population_Density"))
+
+GEE <- GEE[, -c("system:index", "random", ".geo", "Pixel_Lat", "Pixel_Long", "Resolve_Biome")]
+
+#Create weighted subset data
+DominanceRarity <- fread("~/Documents/PhD projects/Map of evenness/DominanceRarity11-08-2021.csv")
+DominanceRarity_plot <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_perc_sp == max(BA_perc_sp))
+DominanceRarity_plotFilter <- DominanceRarity_plot[which(DominanceRarity_plot$Rarity > 0),]
+
+DominanceRarity_GEE <- left_join(DominanceRarity_plotFilter, GEE, by="plot_id")
+
+GFBI_Biome_Species <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Biome_Species.csv")
+GFBI_tph <- as.data.frame(select(GFBI_Biome_Species, tph, plot_id))
+GFBI_tph <- GFBI_tph %>% group_by(plot_id) %>% slice(1)
+
+Global_GEE_tph <- left_join(DominanceRarity_GEE, GFBI_tph, by="plot_id")
+Global_GEE_tph <- Global_GEE_tph[complete.cases(Global_GEE_tph), ]
+
+#Divide data in biomes
+table(Global_GEE_tph$Biome) #Only select plots with dominant and rare species
+Biome1 <- as.data.frame(subset(Global_GEE_tph, Biome == 1)) #5389
+Biome2 <- as.data.frame(subset(Global_GEE_tph, Biome == 2)) #1693
+Biome3 <- as.data.frame(subset(Global_GEE_tph, Biome == 3)) #591
+Biome4 <- as.data.frame(subset(Global_GEE_tph, Biome == 4)) #307590
+Biome5 <- as.data.frame(subset(Global_GEE_tph, Biome == 5)) #46754
+Biome6 <- as.data.frame(subset(Global_GEE_tph, Biome == 6)) #20411 
+
+#Create a weighted global dataset with the forest biomes
+Biome2_subset <- Biome2 %>% sample_n(1000)
+Biome4_subset <- Biome4 %>% sample_n(2361)
+Biome5_subset <- Biome5 %>% sample_n(1000)
+Biome6_subset <- Biome6 %>% sample_n(3941)
+Forest_Global <- rbind(Biome1, Biome2_subset, Biome3, Biome4_subset, Biome5_subset, Biome6_subset) #14282
+
+setwd("~/Documents/PhD projects/Map of evenness")
+fwrite(Forest_Global, file="Forest_Global.csv")
+
+Forest_Global <- fread("~/Documents/PhD projects/Map of evenness/Forest_Global.csv")
+
+###Correlations
+Forest_Global_Select <- Forest_Global[which(Forest_Global$Rarity>0),]
+cor.test(Forest_Global_Select$BA_perc_sp, Forest_Global_Select$Rarity, method="pearson") #p<0.001 r=0.23
+summary(lm(BA_perc_sp~Rarity, data=Forest_Global_Select)) #r2=0.05
+
+Biome_correlations <- Forest_Global_Select %>% group_by(Biome) %>% summarise(Pvalue = cor.test(BA_perc_sp, Rarity)$p.value, Correlation = cor.test(BA_perc_sp, Rarity)$estimate)
+BorealForest <- Forest_Global[which(Biome == 6),]
+summary(lm(BA_perc_sp~Rarity, data=BorealForest)) #r2=0.56
+
+cor.test(Forest_Global$Rarity, log(Forest_Global$S)) #p<0.001, r=0.26
+summary(lm(Rarity~log(S), data=Forest_Global)) #r2=0.07
+
+cor.test(Forest_Global$BA_perc_sp, log(Forest_Global$S)) #p<0.001, r=-0.77
+summary(lm(BA_perc_sp~log(S), data=Forest_Global)) #r2=0.59
+
+
+###Random forest
+Forest_Global$plotsize <- 1/Forest_Global$tph
+rfDom <- randomForest(BA_perc_sp ~ S + plotsize + tph + Fraction_RegrowthForest + MeanAge_RegrowthForest + Mean_Temperate + Temperature_Seasonality + Precipitation + Precipitation_Seasonality + Sand_Content + Soil_pH + Elevation + Human_development + Population_Density + Biome, data=Forest_Global, importance=TRUE, proximity=TRUE)
+print(rfDom) # % Var explained: 73%
+Variable_importance <- as.data.frame(round(importance(rfDom, scale=TRUE), 2)) 
+Variable_importance$Perc <- (Variable_importance$'%IncMSE'/sum(Variable_importance$'%IncMSE')*100) #Biome explains 2.7%, S explains 26.1%, plotsize explains 3.9%
+Var_importance <- Variable_importance[-1,] #Take S out
+Var_importance <- Variable_importance[-2,] #Take plotsize out
+Var_importance <- Var_importance[-13,] #Take Biomes out
+Var_importance$'%IncMSE' <- as.numeric(Var_importance$'%IncMSE')
+Var_importance$Perc <- (Var_importance$'%IncMSE'/sum(Var_importance$'%IncMSE')*100)
+Var_importance$Variable <- row.names(Var_importance)
+Var_importance$Topic <- "Dominance"
+Var_importance$Category <- c("Tree density", "Human impact", "Human impact", "Climate", "Climate", "Climate", "Climate", "Soil", "Soil", "Elevation", "Human impact", "Human impact")
+
+rfRar <- randomForest(Rarity ~ S + plotsize + tph + Fraction_RegrowthForest + MeanAge_RegrowthForest + Mean_Temperate + Temperature_Seasonality + Precipitation + Precipitation_Seasonality + Sand_Content + Soil_pH + Elevation + Human_development + Population_Density + Biome, data=Forest_Global, importance=TRUE, proximity=TRUE)
+print(rfRar) #% Var explained: 42%
+Variable_importance_Rar <- as.data.frame(round(importance(rfRar, scale=TRUE), 2)) 
+Variable_importance_Rar$Perc <- (Variable_importance_Rar$'%IncMSE'/sum(Variable_importance_Rar$'%IncMSE')*100) #Biome explains 2.4%, S explains 14%, plotsize explains 5.2%
+Var_importance_Rar <- Variable_importance_Rar[-1,]
+Var_importance_Rar <- Var_importance_Rar[-13,]
+Var_importance_Rar$'%IncMSE' <- as.numeric(Var_importance_Rar$'%IncMSE')
+Var_importance_Rar$Perc <- (Var_importance_Rar$'%IncMSE'/sum(Var_importance_Rar$'%IncMSE')*100)
+Var_importance_Rar$Variable <- row.names(Var_importance_Rar)
+Var_importance_Rar$Topic <- "Rarity"
+Var_importance_Rar$Category <- c("Tree density", "Human impact", "Human impact", "Climate", "Climate", "Climate", "Climate", "Soil", "Soil", "Elevation", "Human impact", "Human impact")
+
+VariableImportance <- rbind(Var_importance_Rar, Var_importance)
+
+VariableImportance <- VariableImportance %>% group_by(Topic, Category) %>% mutate(Sum = sum(Perc)) %>% as.data.frame()
+
+setwd("~/Documents/PhD projects/Map of evenness")
+fwrite(VariableImportance, file="VariableImportanceRF12-08-2021.csv")
+
+###Graph variable importance
+VariableImportance <- fread("~/Documents/PhD projects/Map of evenness/VariableImportanceRF12-08-2021.csv")
+
+VariableImportance$Category <- factor(VariableImportance$Category, levels=c("Elevation", "Tree density", "Human impact", "Forest age", "Climate", "Soil"))
+
+Graph_VarImportance <- ggplot(data = VariableImportance, aes(y = Perc, x = Topic, fill = factor(Category))) + 
+  geom_bar(stat="identity", position = "stack") + scale_fill_manual(values=c("#000000", "#828181", "#6e60bd", "#76bd60", "#ebd934", "#eb9234")) + 
+  theme_classic()+  ggtitle("Global forests")+ ylab("Variable importance (%)")+
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "bottom",
+        legend.text=element_text(size=15),
+        legend.title = element_blank(), 
+        axis.title.x = element_blank(),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.ticks.x=element_blank()) +
+  guides(fill=guide_legend(ncol=2, nrow=3,byrow=TRUE))
+
+###Graph scatterplots
+library(plyr)
+Forest_Global$Dominance_rounded <- round(Forest_Global$BA_perc_sp, digits=0)
+Forest_Global$Rarity_rounded <- round(Forest_Global$Rarity, digits=0)
+Forest_Global$Sand_rounded <- Forest_Global$Sand_Content/10
+Forest_Global$Sand_rounded <- round_any(Forest_Global$Sand_rounded,0.5)
+Forest_Global$Sand_rounded <- Forest_Global$Sand_rounded*10
+Forest_Global$ForestAge_rounded <- Forest_Global$MeanAge_RegrowthForest/10
+Forest_Global$ForestAge_rounded <- round_any(Forest_Global$ForestAge_rounded,0.5)
+Forest_Global$ForestAge_rounded <- Forest_Global$ForestAge_rounded*10
+Forest_Global$Precipitation_rounded <- round(Forest_Global$Precipitation/100, digits=0)
+Forest_Global$Precipitation_rounded <- Forest_Global$Precipitation_rounded*100
+detach("package:plyr", unload=TRUE)
+
+#summary(lm(Forest_Global$Dominance_rounded ~ poly(Forest_Global$Precipitation_rounded, 2)))
+GraphClimateD <- ggplot(Forest_Global, aes(Precipitation_rounded, logit(Dominance_rounded))) + #, colour=factor(Biome)
+  geom_point(alpha=0.1, color="#ebd934") + annotate("text", label = "r^2 == 0.27", parse=TRUE, x = 2700, y = 3.5, size = 5, colour = "black") + 
+  #scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a", #"#025914", "#473901")) +
+  geom_smooth(aes(group=1), method="lm", formula = y~poly(x,2), colour="black") + xlim(c(0,3000)) + theme_classic() + #ylim(c(20,100)) + 
+  ylab("Dominance") + xlab("Annual Precipitation (mm)") + ggtitle("Climate") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+glmGaussian <-glm(log(Forest_Global$Dominance_rounded)~Precipitation_rounded, data = Forest_Global, family=gaussian(link="log")) #0.28
+pR2(glmGaussian)#['McFadden'] #calculate McFadden's R-squared for model #library(pscl)
+GraphClimateDLoess <- ggplot(Forest_Global, aes(Precipitation_rounded, Dominance_rounded)) + 
+  geom_point(alpha=0.1, color="#ebd934") + annotate("text", label = "r^2 == 0.28", parse=TRUE, x = 2700, y = 95, size = 5, colour = "black") + 
+  geom_smooth(aes(group=1), method = "glm", method.args = list(family=gaussian(link="log")), colour="black") + xlim(c(0,3000)) + theme_classic() + 
+  ylab("Dominance") + xlab("Annual Precipitation (mm)") + ggtitle("Climate") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+#summary(lm(Forest_Global$Dominance_rounded ~ poly(Forest_Global$Sand_rounded, 2)))
+GraphSoilD <- ggplot(Forest_Global, aes(Sand_rounded, logit(Dominance_rounded))) + #, colour=factor(Biome)
+  geom_point(alpha=0.1, color="#eb9234") + annotate("text", label = "r^2 == 0.07", parse=TRUE, x = 65, y = 3.5, size = 5, colour = "black") +
+  #scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a", "#025914", "#473901")) +
+  geom_smooth(aes(group=1), method="lm", formula = y~poly(x,2), colour="black", span=0.8) + xlim(c(10,70))+ theme_classic() + #ylim(c(20,100)) +
+  ylab("Dominance") + xlab("Sand content (%)") + ggtitle("Soil") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+glmGaussian <-glm(log(Forest_Global$Dominance_rounded)~Sand_rounded, data = Forest_Global, family=gaussian(link="log")) #0.08
+pR2(glmGaussian)#['McFadden'] #calculate McFadden's R-squared for model #library(pscl)
+GraphSoilDLoess <- ggplot(Forest_Global, aes(Sand_rounded, Dominance_rounded)) + 
+  geom_point(alpha=0.1, color="#eb9234") + annotate("text", label = "r^2 == 0.08", parse=TRUE, x = 65, y = 95, size = 5, colour = "black") +
+  geom_smooth(aes(group=1), method = "glm", method.args = list(family=gaussian(link="log")), colour="black", span=0.8) + xlim(c(10,70))+ theme_classic() + 
+  ylab("Dominance") + xlab("Sand content (%)") + ggtitle("Soil") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+#summary(lm(Forest_Global$Dominance_rounded ~ poly(Forest_Global$ForestAge_rounded, 3)))
+GraphAgeD <- ggplot(Forest_Global, aes(ForestAge_rounded, logit(Dominance_rounded))) + #, colour=factor(Biome)
+  geom_point(alpha=0.1, color="#76bd60") + annotate("text", label = "r^2 == 0.26", parse=TRUE, x = 90, y = 3.5, size = 5, colour = "black") +
+  #scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a", "#025914", "#473901")) +
+  geom_smooth(aes(group=1), method="lm", formula = y~poly(x,3), colour="black", span=0.8) + xlim(c(0,100)) +  theme_classic() + #ylim(c(20,100)) +
+  ylab("Dominance") + xlab("Forest Age (yr)") + ggtitle("Forest age") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+
+glmGaussian <-glm(log(Forest_Global$Dominance_rounded)~ForestAge_rounded, data = Forest_Global, family=gaussian(link="log")) #0.28
+pR2(glmGaussian)#['McFadden'] #calculate McFadden's R-squared for model #library(pscl)
+GraphAgeDLoess <- ggplot(Forest_Global, aes(ForestAge_rounded, Dominance_rounded)) + 
+  geom_point(alpha=0.1, color="#76bd60") + annotate("text", label = "r^2 == 0.28", parse=TRUE, x = 90, y = 95, size = 5, colour = "black") +
+  geom_smooth(aes(group=1), method = "glm", method.args = list(family=gaussian(link="log")), colour="black", span=1) + xlim(c(0,100)) +  ylim(c(0,100)) + theme_classic() +
+  ylab("Dominance") + xlab("Forest Age (yr)") + ggtitle("Forest age") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+#summary(lm(Forest_Global$Rarity_rounded ~ poly(Forest_Global$Precipitation_rounded, 3)))
+GraphClimateR <- ggplot(Forest_Global, aes(Precipitation_rounded, logit(Rarity_rounded))) + #, colour=factor(Biome)
+  geom_point(alpha=0.1, color="#ebd934") + annotate("text", label = "r^2 == 0.01", parse=TRUE, x = 2700, y = 2, size = 5, colour = "black") +
+  scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a", "#025914", "#473901")) +
+  geom_smooth(aes(group=1), method="lm", formula = y~poly(x,2), colour="black", span=0.8) + xlim(c(0,3000)) + ylim(c(-2,2)) + theme_classic() + 
+  ylab("Rarity") + xlab("Annual Precipitation (mm)") + ggtitle("Climate") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+glmGaussian <-glm(log(Forest_Global$Rarity_rounded)~Precipitation_rounded, data = Forest_Global, family=gaussian(link="log")) #0.001
+pR2(glmGaussian)#['McFadden'] #calculate McFadden's R-squared for model #library(pscl)
+GraphClimateRLoess <- ggplot(Forest_Global, aes(Precipitation_rounded, Rarity_rounded)) + 
+  geom_point(alpha=0.1, color="#ebd934") + annotate("text", label = "r^2 == 0.001", parse=TRUE, x = 2700, y = 95, size = 5, colour = "black") +
+  scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a", "#025914", "#473901")) +
+  geom_smooth(aes(group=1), method = "glm", method.args = list(family=gaussian(link="log")), colour="black", span=1) + xlim(c(0,3000)) + ylim(c(0,100)) + theme_classic() + #ylim(c(-2,2)) + 
+  ylab("Rarity") + xlab("Annual Precipitation (mm)") + ggtitle("Climate") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+#summary(lm(Forest_Global$Rarity_rounded ~ poly(Forest_Global$Sand_rounded, 3)))
+GraphSoilR <- ggplot(Forest_Global, aes(Sand_rounded, logit(Rarity_rounded))) + #, colour=factor(Biome)
+  geom_point(alpha=0.1, color="#eb9234") + annotate("text", label = "r^2 == 0.01", parse=TRUE, x = 65, y = 2, size = 5, colour = "black") +
+  #scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a", "#025914", "#473901")) +
+  geom_smooth(aes(group=1), method="lm", formula = y~poly(x,2), colour="black", span=0.8) + xlim(c(10,70))+ ylim(c(-2,2)) + theme_classic() + #ylim(c(0,100)) +
+  ylab("Rarity") + xlab("Sand content (%)") + ggtitle("Soil") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+glmGaussian <-glm(log(Forest_Global$Rarity_rounded)~Sand_rounded, data = Forest_Global, family=gaussian(link="log")) #0.01
+pR2(glmGaussian)#['McFadden'] #calculate McFadden's R-squared for model #library(pscl)
+GraphSoilRLoess <- ggplot(Forest_Global, aes(Sand_rounded, Rarity_rounded)) + #, colour=factor(Biome)
+  geom_point(alpha=0.1, color="#eb9234") + annotate("text", label = "r^2 == 0.01", parse=TRUE, x = 65, y = 95, size = 5, colour = "black") +
+  geom_smooth(aes(group=1), method = "glm", method.args = list(family=gaussian(link="log")), colour="black", span=1) + xlim(c(10,70))+ ylim(c(0,100)) + theme_classic() + 
+  ylab("Rarity") + xlab("Sand content (%)") + ggtitle("Soil") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+#summary(lm(Forest_Global$Rarity_rounded ~ poly(Forest_Global$ForestAge_rounded, 2)))
+GraphAgeR <- ggplot(Forest_Global, aes(ForestAge_rounded, logit(Rarity_rounded))) + #, colour=factor(Biome)
+  geom_point(alpha=0.1, color="#76bd60") + annotate("text", label = "r^2 == 0.05", parse=TRUE, x = 90, y = 2, size = 5, colour = "black") +
+  #scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a", "#025914", "#473901")) +
+  geom_smooth(aes(group=1), method="lm", formula = y~poly(x,2), colour="black", span=0.8) + xlim(c(0,100)) + ylim(c(-2,2)) + theme_classic() + #ylim(c(20,100)) +
+  ylab("Rarity") + xlab("Forest Age (yr)") + ggtitle("Forest age") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+glmGaussian <-glm(log(Forest_Global$Rarity_rounded)~ForestAge_rounded, data = Forest_Global, family=gaussian(link="log")) #0.06
+pR2(glmGaussian)#['McFadden'] #calculate McFadden's R-squared for model #library(pscl)
+GraphAgeRLoess <- ggplot(Forest_Global, aes(ForestAge_rounded, Rarity_rounded)) + 
+  geom_point(alpha=0.1, color="#76bd60") + annotate("text", label = "r^2 == 0.06", parse=TRUE, x = 90, y = 95, size = 5, colour = "black") +
+  geom_smooth(aes(group=1), method = "glm", method.args = list(family=gaussian(link="log")), colour="black", span=1) + xlim(c(0,100)) + ylim(c(0,100)) + theme_classic() +
+  ylab("Rarity") + xlab("Forest Age (yr)") + ggtitle("Forest age") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position="none",
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15),
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15))
+
+layout=rbind(c(1,2,5), c(1,3,6), c(1,4,7))
+grid.arrange(Graph_VarImportance, GraphAgeDLoess,GraphClimateDLoess,GraphSoilDLoess,GraphAgeRLoess,GraphClimateRLoess,GraphSoilRLoess, layout_matrix=layout, nrow=3)
+```
+
+###Identify dominant and rare species
+```{r Identify Dominant Rare sp}
+#Code 13-2021
+setwd("~/Documents/PhD projects/Map of evenness")
+DominanceRarity <- fread("~/Documents/PhD projects/Map of evenness/DominanceRarity11-08-2021.csv")
+
+DR_calculations <- DominanceRarity %>% group_by(Biome, species_name) %>% mutate(N_plots = n())
+DR_calculations_Biome <- DR_calculations %>% group_by(Biome, species_name) %>% mutate(Mean_BA = mean(BA_perc_sp)/N_plots) %>% distinct(species_name) %>% as.data.frame()
+
+Dominant_Biome <- DR_calculations_Biome %>% group_by(Biome) %>% filter 
+
+Dominant_spp <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_cumsum > 89) #669044
+Dominant_sppFilter <- Dominant_spp %>% group_by(Biome) %>% distinct(species_name) %>% as.data.frame() #2344 species dominant #at average in 285 plots (3.6 times more than rare species)
+Dominant_sppFilter$DominanceCategory <- "dominant"
+
+Rare_spp <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_cumsum < 11) #811974
+Rare_sppFilter <- Rare_spp %>% group_by(Biome) %>% distinct(species_name) %>% as.data.frame() #10132 species rare #at average in 80 plots
+Rare_sppFilter$DominanceCategory <- "rare"
+
+#####Final code
+setwd("~/Documents/PhD projects/Map of evenness")
+DominanceRarity <- fread("~/Documents/PhD projects/Map of evenness/DominanceRarity11-08-2021.csv")
+
+# Dominant_spp <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_cumsum > 89) #669044
+# Dominant_spp_Nr <- Dominant_spp %>% group_by(Biome, species_name) %>% mutate(N_DR=n())  
+# Dominant_sppFilter <- Dominant_spp_Nr %>% group_by(Biome) %>% distinct(species_name,.keep_all = TRUE) %>% as.data.frame() #2344 species dominant #at average in 285 plots (3.6 times more than rare species)
+# Dominant_sppFilter$DominanceCategory <- "dominant"
+
+#####Definition D based on single most dominant species
+Dominant_spp <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_perc_sp == max(BA_perc_sp)) #669644
+Dominant_spp_Nr <- Dominant_spp %>% group_by(Biome, species_name) %>% mutate(N_DR=n())  
+Dominant_sppFilter <- Dominant_spp_Nr %>% group_by(Biome) %>% distinct(species_name,.keep_all = TRUE) %>% as.data.frame() #2487 species dominant 
+Dominant_sppFilter$DominanceCategory <- "dominant"
+
+Rare_spp <- DominanceRarity %>% group_by(plot_id) %>% filter(BA_cumsum < 11) #811974
+Rare_spp_Nr <- Rare_spp %>% group_by(Biome, species_name) %>% mutate(N_DR=n())  
+Rare_sppFilter <- Rare_spp_Nr %>% group_by(Biome) %>% distinct(species_name,.keep_all = TRUE) %>% as.data.frame() #10132 species rare #at average in 80 plots
+Rare_sppFilter$DominanceCategory <- "rare"
+
+Species_DR <- rbind(Dominant_sppFilter, Rare_sppFilter)
+
+#Check if rare species are also dominant, in that case keep only as dominant species
+Unique_SpeciesSelect <- Species_DR %>% group_by(Biome, species_name) %>% filter(n() == 1) #8382
+Unique_SpeciesDuplicate <- Species_DR %>% group_by(Biome, species_name) %>% filter(n() > 1) #Duplicate species: Biome 1 13%, Biome 2 24%, Biome 3 37%, Biome 4 46%, Biome 5 60%, Biome 6 76% #There are no duplicate species which occur in more than 1 biome
+
+Dominant_species <- Unique_SpeciesDuplicate[which(Unique_SpeciesDuplicate$DominanceCategory == "dominant"),]
+Rare_species <- Unique_SpeciesDuplicate[which(Unique_SpeciesDuplicate$DominanceCategory == "rare"),]
+Dominant_species$Ratio <- (Dominant_species$N_DR/(Rare_species$N_DR+Dominant_species$N_DR))*100
+Rare_species$Ratio <- (Rare_species$N_DR/(Rare_species$N_DR+Dominant_species$N_DR))*100
+
+Dominant_species <- Dominant_species[which(Dominant_species$Ratio > 95),]
+Rare_species <- Rare_species[which(Rare_species$Ratio > 95),]
+
+DomRare_species <- rbind(Dominant_species, Rare_species) #rbind dominant and rare species
+Species_GFBI <- rbind(Unique_SpeciesSelect, DomRare_species) #8994 species, #dominant 436, #rare 8558 #No duplicate species across biomes
+Species_GFBI_Global <- Species_GFBI %>% ungroup() %>% distinct(species_name, .keep_all = TRUE) #8186 species, #371 dominant, #7815 rare
+
+fwrite(Species_GFBI, file="Species_DR_14-10-2021.csv")
+
+Species_GFBI_unique <- DominanceRarity %>% group_by(Biome) %>% distinct(species_name, .keep_all = TRUE)
+Species_GFBI_unique <- Species_GFBI_unique[, c("species_name", "Biome")]
+Species_GFBI_AllCategories <- left_join(Species_GFBI_unique, Species_GFBI_Global, by=c("Biome", "species_name"))
+table(Species_GFBI_AllCategories$DominanceCategory)
+Species_GFBI_AllCategories$DominanceCategory[is.na(Species_GFBI_AllCategories$DominanceCategory)] <- "Intermediate"
+
+fwrite(Species_GFBI_AllCategories, file="Species_DRI_Monodominant_10-08-2022.csv") #Dominant so is single most dominant sp based on BA
+fwrite(Species_GFBI_AllCategories, file="Species_DRI_09-08-2022.csv") #DR sp are most/least 10% BA
+
+#For data extraction EOO all species
+Species_GFBI_SelectSpNames <- Species_GFBI_AllCategories[ which(Species_GFBI_AllCategories$DominanceCategory=="Intermediate"),]
+Species_list <- as.data.frame(unique(Species_GFBI_SelectSpNames$species_name))
+names(Species_list)[1] <- "species_name"
+
+fwrite(Species_list, file="GFBI_Intermediate species.csv")
+
+#####Definition DR based on #stems
+setwd("~/Documents/PhD projects/Map of evenness")
+DominanceRarity <- fread("~/Documents/PhD projects/Map of evenness/DominanceRarity11-08-2021.csv")
+
+#Calculate sum #stems per per plot 
+Stems_total <- DominanceRarity %>% group_by(plot_id) %>% mutate(Stems_plot = sum(IndPerSp))
+
+#Calculate relative BA per species
+Stems_perc <- Stems_total %>% group_by(plot_id, species_name) %>% mutate(Stems_perc_sp = (IndPerSp/Stems_plot)*100) 
+Stems_perc_sum <- Stems_perc %>% group_by(plot_id) %>% arrange(Stems_perc_sp) %>% mutate(Stems_cumsum = cumsum(Stems_perc_sp))
+
+Dominant_spp <- Stems_perc_sum %>% group_by(plot_id) %>% filter(Stems_cumsum > 89) #669644
+Dominant_spp_Nr <- Dominant_spp %>% group_by(Biome, species_name) %>% mutate(N_DR=n())  
+Dominant_sppFilter <- Dominant_spp_Nr %>% group_by(Biome) %>% distinct(species_name,.keep_all = TRUE) %>% as.data.frame() #2487 species dominant 
+Dominant_sppFilter$DominanceCategory <- "dominant"
+
+Rare_spp <- Stems_perc_sum %>% group_by(plot_id) %>% filter(Stems_cumsum < 11) #544932
+Rare_spp_Nr <- Rare_spp %>% group_by(Biome, species_name) %>% mutate(N_DR=n())  
+Rare_sppFilter <- Rare_spp_Nr %>% group_by(Biome) %>% distinct(species_name,.keep_all = TRUE) %>% as.data.frame() #8938 species rare 
+Rare_sppFilter$DominanceCategory <- "rare"
+
+Species_DR <- rbind(Dominant_sppFilter, Rare_sppFilter) #11425
+
+#Check if rare species are also dominant, in that case keep only as dominant species
+Unique_SpeciesSelect <- Species_DR %>% group_by(Biome, species_name) %>% filter(n() == 1) #7183
+Unique_SpeciesDuplicate <- Species_DR %>% group_by(Biome, species_name) %>% filter(n() > 1) #Duplicate species: Biome 1 13%, Biome 2 24%, Biome 3 37%, Biome 4 46%, Biome 5 60%, Biome 6 76% #There are no duplicate species which occur in more than 1 biome
+
+Dominant_species <- Unique_SpeciesDuplicate[which(Unique_SpeciesDuplicate$DominanceCategory == "dominant"),]
+Rare_species <- Unique_SpeciesDuplicate[which(Unique_SpeciesDuplicate$DominanceCategory == "rare"),]
+Dominant_species$Ratio <- (Dominant_species$N_DR/(Rare_species$N_DR+Dominant_species$N_DR))*100
+Rare_species$Ratio <- (Rare_species$N_DR/(Rare_species$N_DR+Dominant_species$N_DR))*100
+
+Dominant_species <- Dominant_species[which(Dominant_species$Ratio > 95),]
+Rare_species <- Rare_species[which(Rare_species$Ratio > 95),]
+
+DomRare_species <- rbind(Dominant_species, Rare_species) #rbind dominant and rare species
+Species_GFBI <- rbind(Unique_SpeciesSelect, DomRare_species) #8994 species, #dominant 164, #rare 428 #No duplicate species across biomes
+#Unique_SpeciesDuplicate <- Species_GFBI %>% group_by(Biome, species_name, DominanceCategory) %>% filter(n() > 1) 
+Species_GFBI_Global <- Species_GFBI %>% ungroup() %>% distinct(species_name, .keep_all = TRUE) #8186 species, #371 dominant, #7815 rare
+
+Species_GFBI_unique <- DominanceRarity %>% group_by(Biome) %>% distinct(species_name, .keep_all = TRUE)
+Species_GFBI_unique <- Species_GFBI_unique[, c("species_name", "Biome")]
+Species_GFBI_AllCategories <- left_join(Species_GFBI_unique, Species_GFBI_Global, by=c("Biome", "species_name"))
+table(Species_GFBI_AllCategories$DominanceCategory)
+Species_GFBI_AllCategories$DominanceCategory[is.na(Species_GFBI_AllCategories$DominanceCategory)] <- "Intermediate"
+
+fwrite(Species_GFBI_AllCategories, file="SpeciesStems_DRI_10-08-2022.csv") #DR sp are most/least 10% Stems
+
+```
+
+###IUCN Analyses
+```{r IUCN}
+###Average EOO per biome
+Countries <- fread("~/Documents/PhD projects/Map of evenness/IUCN Data Oct 2022/countries.csv")
+Countries_select <- subset(Countries, select=c(name, scientificName))
+
+Biomes <- fread("~/Documents/PhD projects/Map of evenness/GADM36_biomeAreas.csv")
+Biomes_select <- subset(Biomes, select=c(NAME, biome01_pct, biome02_pct, biome03_pct, biome04_pct, biome05_pct, biome06_pct))
+
+Biomes_country <- left_join(Countries, Biomes_select, by=c("name"="NAME")) %>% as.data.frame()
+dim(Biomes_country)
+
+#Only select biomes with 1% of land surface, unless it is the only forest biome
+
+IUCN_Data <- fread("~/Documents/PhD projects/Map of evenness/IUCN Data Oct 2022/all_other_fields.csv")
+IUCN_EOO <- subset(IUCN_Data, select=c(scientificName, EOO.range))
+IUCN_EOO <- IUCN_EOO[complete.cases(IUCN_EOO$EOO.range),] 
+
+IUCN_EOO_country <- left_join(IUCN_EOO, Biomes_country) %>% as.data.frame()
+IUCN_EOO_country <- IUCN_EOO_country[complete.cases(IUCN_EOO_country$biome01_pct),] 
+
+#Range per biome
+IUCN_EOO_country$EOO.range <- as.numeric(IUCN_EOO_country$EOO.range)
+IUCN_EOO_country <- IUCN_EOO_country[complete.cases(IUCN_EOO_country$EOO.range),] 
+
+EOO_Biome1 <- as.data.frame(IUCN_EOO_country[which(IUCN_EOO_country$biome01_pct > 1),]) 
+Av_EOO_Biome1 <- EOO_Biome1 %>% group_by(scientificName) %>% filter(row_number()==1) 
+#%>% ungroup() %>% summarise(Mean_EOO=mean(EOO.range)) #1683202
+
+EOO_Biome2 <- as.data.frame(IUCN_EOO_country[which(IUCN_EOO_country$biome02_pct > 1),]) 
+Av_EOO_Biome2 <- EOO_Biome2 %>% group_by(scientificName) %>% filter(row_number()==1) %>% ungroup() %>% summarise(Mean_EOO=mean(EOO.range)) #1967324
+
+EOO_Biome3 <- as.data.frame(IUCN_EOO_country[which(IUCN_EOO_country$biome03_pct > 1),]) 
+Av_EOO_Biome3 <- EOO_Biome3 %>% group_by(scientificName) %>% filter(row_number()==1) %>% ungroup() %>% summarise(Mean_EOO=mean(EOO.range)) #3357657
+
+EOO_Biome4 <- as.data.frame(IUCN_EOO_country[which(IUCN_EOO_country$biome04_pct > 1),]) 
+Av_EOO_Biome4 <- EOO_Biome4 %>% group_by(scientificName) %>% filter(row_number()==1) %>% ungroup() %>% summarise(Mean_EOO=mean(EOO.range)) #2918363
+
+EOO_Biome5 <- as.data.frame(IUCN_EOO_country[which(IUCN_EOO_country$biome05_pct > 1),]) 
+Av_EOO_Biome5 <- EOO_Biome5 %>% group_by(scientificName) %>% filter(row_number()==1) %>% ungroup() %>% summarise(Mean_EOO=mean(EOO.range)) #4175010
+
+EOO_Biome6 <- as.data.frame(IUCN_EOO_country[which(IUCN_EOO_country$biome06_pct > 1),]) 
+Av_EOO_Biome6 <- EOO_Biome6 %>% group_by(scientificName) %>% filter(row_number()==1) %>% ungroup() %>% summarise(Mean_EOO=mean(EOO.range)) #5218500
+
+###Test if GFBI species differ in mean EOO
+EOO_BGCI <- read.xlsx("~/Documents/PhD projects/Map of evenness/Data_Lalasia050122-EOO.xlsx", 1) 
+EOO_BGCI <- EOO_BGCI %>% select("species_name", "EOO")
+
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/Species_DRI_09-08-2022.csv") #DR sp are most/least 10% BA
+
+Species_GFBI_summary <- Species_GFBI %>% group_by(DominanceCategory) %>% summarise(Perc=(n()/11518)*100)
+
+EOO_GFBI <- left_join(Species_GFBI, EOO_BGCI, by="species_name")
+EOO_GFBI <- EOO_GFBI[complete.cases(EOO_GFBI$EOO),]
+EOO_GFBI <- as.data.frame(EOO_GFBI[which(EOO_GFBI$EOO > 0),])
+
+x=EOO_GFBI[ which(EOO_GFBI$Biome == 1), ] #& EOO_GFBI$DominanceCategory == "dominant"
+
+t.test(log(x$EOO), mu = log(5218500))
+
+#t.test(log(x$EOO), log(Av_EOO_Biome1$EOO.range+1)) 2-sample t-test
+
+#Test results
+#Biome 1: t = -18.072, df = 5609, p-value < 2.2e-16 GFBI > IUCN
+#Biome 2: t = 11.182, df = 721, p-value < 2.2e-16 GFBI > IUCN
+#Biome 3: t = -4.2677, df = 125, p-value = 3.867e-05 GFBI > IUCN
+#Biome 4: t = -1.355, df = 742, p-value = 0.1758
+#Biome 5: t = 2.3102, df = 296, p-value = 0.02157 GFBI > IUCN
+#Biome 6: t = 7.9981, df = 55, p-value = 8.784e-11 GFBI > IUCN
+
+summariseEOO <- EOO_GFBI %>% group_by(Biome) %>% summarise(Mean=mean(EOO), n = n())
+
+###Range graphs for Appendix 
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/Species_DRI_09-08-2022.csv") #DR sp are most/least 10% BA
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/Species_DRI_Monodominant_10-08-2022.csv") #Dominant sp is single most dominant sp based on BA
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/SpeciesStems_DRI_10-08-2022.csv") #DR based on stems
+Assessment <- fread("~/Documents/PhD projects/Map of evenness/IUCN Data/assessments.csv") #Load IUCN Data
+
+Assessment <- subset(Assessment, select=c(assessmentId, scientificName, redlistCategory, yearPublished, populationTrend, realm))
+GFBI_Assessment <- left_join(Species_GFBI, Assessment, by=c("species_name"="scientificName")) 
+GFBI_Assessment <- GFBI_Assessment[complete.cases(GFBI_Assessment$redlistCategory),] 
+
+Select_Assessment <- as.data.frame(GFBI_Assessment[which(GFBI_Assessment$redlistCategory == "Vulnerable" | 
+                                         GFBI_Assessment$redlistCategory == "Endangered" | GFBI_Assessment$redlistCategory == "Critically Endangered"),])
+
+Range_final <- fread("~/Documents/PhD projects/Map of evenness/Range_Assesment_11-08-2021.csv")
+Select_Assessment_sp <- Select_Assessment %>% select(species_name, DominanceCategory)
+
+Range_final_unique <- Range_final %>% distinct(species_name, .keep_all = TRUE) %>% select(-DominanceCategory) %>% as.data.frame()
+Range_Assessment <- left_join(Select_Assessment_sp, Range_final_unique, by="species_name") %>% as.data.frame()
+
+Range_Assessment$EOO.km2. <- as.numeric(Range_Assessment$EOO.km2.)
+Range_EOO <- Range_Assessment[which(Range_Assessment$EOO.km2.> 0),] #Range_EOO <- as.data.frame(RangeCompleteEOO[which(RangeCompleteEOO$EOO.km2.!="Unknown"),])
+Range_EOO$EOO.km2. <- as.numeric(as.character(Range_EOO$EOO.km2.))
+
+# ###Difference between EOO dom/rare species by biome
+# Range_EOO$logEOO <- log(Range_EOO$EOO.km2.)
+# 
+# Range_EOO_Select <- Range_EOO[which(!Range_EOO$Biome == 3 & !Range_EOO$Biome == 5),] #Biome 6 has not enough datapoints
+# Results_Test <- Range_EOO_Select %>% group_by(Biome) %>% summarise(Pvalue_tTest = t.test(logEOO ~ DominanceCategory)$p.value) %>% as.data.frame()
+# #   Biome Pvalue_tTest
+# # 1     1 0.044
+# # 2     2 0.046
+# # 4     4 0.47
+
+#ScaledEOO <- Range_EOO %>% group_by(Biome) %>% mutate_at(vars(EOO.km2.), scale) 
+MeanEOO <- Range_EOO %>% group_by(Biome, DominanceCategory) %>% summarise(n = n(), Mean=mean(EOO.km2.), se=(sd(EOO.km2.)/sqrt(n))) %>% as.data.frame()
+
+###Graph EOO
+Mean_Biome <- EOO_Select %>% group_by(Biome, DominanceCategory) %>% summarise(meanEOO = mean(EOO), sdEOO=sd(EOO), se=std.error(EOO), N=n()) %>% as.data.frame()
+
+EOO_BGCI_Graph <- ggplot(data=MeanEOO, aes(y=factor(Biome), x=Mean, colour=DominanceCategory)) + geom_point(size=4) +
+  geom_errorbar(aes(xmin=Mean-se, xmax=Mean+se), position = position_dodge(1), color="black", width=.1) +
+  scale_color_manual(breaks = c("dominant", "rare"), values=c("black", "deepskyblue", "grey")) + 
+  #geom_vline(xintercept = 0, linetype="dotted", color = "grey", size=1.5) +
+  scale_x_continuous(labels = function(l) {trans = l / 100000 }) + 
+  theme_classic() + ggtitle("Species range") +  xlab("EOO (1000 ha)") + #xlim(-0.5,0.5) + #ylab("Altitude (m)") +
+  scale_y_discrete(limits=rev, labels=c("Temperate Conifer", "Temperate", "Tropical conifer", "Tropical dry", "Tropical moist")) + 
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 14, face="bold"),
+        axis.text.x = element_text(size = 14),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 16))
+
+
+###BA
+setwd("~/Documents/PhD projects/Map of evenness")
+
+#Load GFBI Data
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/Species_DRI_09-08-2022.csv") #Biome level
+
+# Species_BGCI <- Species_GFBI %>% distinct(species_name) #, .keep_all = TRUE
+# length(unique(Species_BGCI$species_name)) == nrow(Species_BGCI)
+# head(Species_BGCI)
+# fwrite(Species_BGCI, file="Species_BGCI.csv")
+
+#Load IUCN Data
+Threats <- fread("~/Documents/PhD projects/Map of evenness/IUCN Data/threats.csv")
+Assessment <- fread("~/Documents/PhD projects/Map of evenness/IUCN Data/assessments.csv")
+
+Assessment <- subset(Assessment, select=c(assessmentId, scientificName, redlistCategory, yearPublished, populationTrend, realm))
+Threats <- subset(Threats, select =c(assessmentId, scientificName, name, stressCode, stressName, severity))
+IUCN_Data <- left_join(Assessment, Threats, by="scientificName") #11052 unique species
+
+GFBI_Assessment <- left_join(Species_GFBI, Assessment, by=c("species_name"="scientificName")) 
+GFBI_Assessment <- GFBI_Assessment[complete.cases(GFBI_Assessment$redlistCategory),] #4076 species #299 dominant, 3777 rare
+GFBI_Assessment_DataDef <- GFBI_Assessment[which(GFBI_Assessment$redlistCategory == "Data Deficient"),]
+table(GFBI_Assessment_DataDef$DominanceCategory) #4 dominant and 7 rare species globally data deficient
+
+###Table of asessed and data deficient species at biome level
+GFBI_Count <- Species_GFBI %>% group_by(Biome, DominanceCategory) %>% summarise(N=n()) %>% as.data.frame()
+Assessment_Count <- GFBI_Assessment %>% group_by(Biome, DominanceCategory) %>% summarise(N_Assessed=n()) %>% as.data.frame()
+GFBI_Assessment_DataDef <- GFBI_Assessment[which(GFBI_Assessment$redlistCategory == "Data Deficient"),]
+DataDeficient_Count <- GFBI_Assessment_DataDef %>% group_by(Biome, DominanceCategory) %>% summarise(N_DataDef=n()) %>% as.data.frame()
+GFBI_Count$DataDef <- c(1, 16, 0, 1, 0, 1, 3, 9, 0, 0, 0, 0)
+
+GFBI_Count$Perc_Assesed <- ((Assessment_Count$N_Assessed)/(GFBI_Count$N))*100
+GFBI_Count$Perc_DataDef <- ((GFBI_Count$DataDef)/(Assessment_Count$N_Assessed))*100
+
+#########Global graphs
+###Evaluate percentage population trend 
+GFBI_Assessment_Check <- GFBI_Assessment %>% group_by(species_name) %>% slice(1) #4086 species #961 dominant, 3125 rare
+
+Select_Assessment <- as.data.frame(GFBI_Assessment[which(GFBI_Assessment$redlistCategory == "Vulnerable" | 
+                                         GFBI_Assessment$redlistCategory == "Endangered" | GFBI_Assessment$redlistCategory == "Critically Endangered"),]) #341 #GFBI_Assessment$redlistCategory == "Near Threatened"  species #34 dominant (11%), 307 rare species (8%)
+
+Select_Assessment_Check <- Select_Assessment %>% group_by(species_name) %>% slice(1) #390 species #114 dominant (12%), 276 rare (9%)
+
+#63 duplicates, 43 duplicates same dominance category, 20 both dominance categories
+No_Duplicates <- Select_Assessment %>% group_by(species_name) %>% filter(n()==1) %>% arrange(species_name) %>% as.data.frame()
+Duplicates_Check <- Select_Assessment %>% group_by(species_name) %>% filter(n()>1) %>% arrange(species_name) %>% as.data.frame()
+Duplicates_CheckDR_Same <- Duplicates_Check %>% group_by(species_name, DominanceCategory) %>% filter(n()>1) %>% arrange(species_name) %>% as.data.frame()
+Duplicates_CheckDR_Different <- Duplicates_Check %>% group_by(species_name, DominanceCategory) %>% filter(n()==1) %>% arrange(species_name) %>% as.data.frame()
+
+Duplicates_CheckDR_Same_Select <- Duplicates_CheckDR_Same %>% group_by(species_name) %>% slice(1)
+Duplicates_CheckDR_Different_Select <- Duplicates_CheckDR_Different %>% group_by(species_name) %>% filter(DominanceCategory == "dominant")
+
+Global_Assessment <- rbind(No_Duplicates, Duplicates_CheckDR_Same_Select, Duplicates_CheckDR_Different_Select) #391 species #125 dominant (13%), 266 rare (9%)
+
+Select_Assessment$populationTrend <- replace(Select_Assessment$populationTrend,Select_Assessment$populationTrend=="", "Unknown")
+Select_Assessment_summary <- as.data.frame(Select_Assessment %>% group_by(Biome, DominanceCategory, populationTrend) %>% summarise(Nr=n()))
+
+
+#Check if there is a significant difference in population trend of threatened dominant and rare species 
+Pop_Assessment <- as.data.frame(Select_Assessment %>% group_by(DominanceCategory, populationTrend) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100))
+Pop_Assessment <- Pop_Assessment[which(Pop_Assessment$populationTrend!="Unknown"),]
+
+Data_Dom <- as.data.frame(Pop_Assessment[which(Pop_Assessment$DominanceCategory == "dominant"),])
+Data_Dom$N_Dom <- Data_Dom$n
+Data_Dom <- Data_Dom %>% add_row(DominanceCategory = "dominant", populationTrend = "Increasing", n = 0, Perc = 0, N_Dom = 0)
+Data_Dom <- Data_Dom[order(Data_Dom$populationTrend),]
+
+Data_Rare <- as.data.frame(Pop_Assessment[which(Pop_Assessment$DominanceCategory == "rare"),])
+Data_Rare$N_Rare <- Data_Rare$n
+
+Data <- cbind(Data_Rare, Data_Dom)
+row.names(Data) <- Data$populationTrend
+Data <- select(Data, N_Rare, N_Dom)
+
+fisher.test(Data) #Null hypothesis: no association #p=0.7741 there is no difference between rows and columns (Change in MS!)
+
+#Biome level
+Pop_Assessment_Biome <- as.data.frame(Select_Assessment %>% ungroup()%>% group_by(Biome, DominanceCategory, populationTrend) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100))
+
+###Graph
+Select_AssessmentCc <- Select_Assessment[complete.cases(Select_Assessment$populationTrend), ] 
+Pop_Assessment <- as.data.frame(Select_AssessmentCc %>% group_by(DominanceCategory, populationTrend) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100))
+Pop_Assessment$populationTrend <- factor(Pop_Assessment$populationTrend, levels=c("Unknown", "Increasing", "Stable", "Decreasing"))
+
+Pop_AssessmentDR <- Pop_Assessment[which(Pop_Assessment$DominanceCategory == "dominant"| Pop_Assessment$DominanceCategory == "rare"),]
+Global_PopulationTrend <-  ggplot(data = Pop_AssessmentDR, aes(y = Perc, x = factor(DominanceCategory), fill=populationTrend)) + 
+  geom_bar(stat="identity", position = "stack") + scale_fill_manual(values=c ("#b5b5b5", "#7d7d7d", "#424242", "#030303")) + #ylim(c(0,1)) +
+  ylab("Threatened species globally (%)") + ggtitle('Population trend') + scale_x_discrete(breaks=c("dominant", "rare"),labels= c("Dominant sp", "Rare sp")) + 
+  geom_label(aes(x = DominanceCategory, y = Perc, label = populationTrend, fontface = "bold"), position = position_stack(vjust = 0.3), size = 5, colour = "white", show.legend = FALSE) +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold")) ###Figure 5
+
+###Evaluate percentage red list category
+Redlist_Assessment <- GFBI_Assessment %>% group_by(DominanceCategory, redlistCategory) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% as.data.frame()
+Redlist_AssessmentFilter <- as.data.frame(Redlist_Assessment[which(Redlist_Assessment$redlistCategory == "Near Threatened" | Redlist_Assessment$redlistCategory == "Vulnerable" | Redlist_Assessment$redlistCategory == "Endangered" | Redlist_Assessment$redlistCategory == "Critically Endangered"),])
+
+#Check if there is a significant difference in threatened species between biomes
+Select_Assessment_Check$Threatened <- 1
+LeastConcern_Assessment <- as.data.frame(GFBI_Assessment_Check[which(GFBI_Assessment_Check$redlistCategory == "Least Concern"),])
+LeastConcern_Assessment$Threatened <- 0
+Difference_Assessment <- rbind(Select_Assessment_Check,LeastConcern_Assessment)
+
+#Difference_Assessment <- Difference_Assessment[which(!Difference_Assessment$Biome==6),] #If moist tropical forest excluded, there is no sign. difference between biomes and dominance categories. #If temp forest excluded, no sig difference between biomes 
+
+#Difference_Assessment <- Difference_Assessment[which(!Difference_Assessment$redlistCategory=="Near Threatened"),]
+Poisson_glm <- glm(Threatened  ~ Biome * DominanceCategory, family = poisson(link = "log"), data=Difference_Assessment) #significant difference between biomes and dominance categories #No significant difference when near threatened is taken out
+summary(Poisson_glm)
+
+Redlist_AssessmentFilter$redlistCategory <- factor(Redlist_AssessmentFilter$redlistCategory, levels=c("Critically Endangered", "Endangered", "Vulnerable", "Near Threatened"))
+
+###Graph
+Redlist_AssessmentFilterCalc <- Redlist_AssessmentFilter %>% group_by(DominanceCategory, redlistCategory) %>% summarise(Mean_perc = mean(Perc))
+Global_RedlistPerc <-  ggplot(data = Redlist_AssessmentFilterCalc, aes(y = Mean_perc, x = factor(DominanceCategory), fill=factor(redlistCategory))) + 
+  geom_bar(stat="identity", position = "stack") + scale_fill_manual(values=c ("#850000", "#a81616", "#e33030", "#ffa8a8")) + #ylim(c(0,1)) +
+  ylab("Species globally (%)") + ggtitle('Red list category') + scale_x_discrete(breaks=c("dominant", "rare"),labels= c("Dominant sp", "Rare sp")) + #scale_y_continuous(labels = function(l) {trans = l * 100 }) + 
+  geom_label(aes(x = DominanceCategory, y = Mean_perc, label = redlistCategory, fontface = "bold"), position = position_stack(vjust = .5), size = 5, colour = "white", show.legend = FALSE) +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold")) 
+
+####################Threats
+GFBI_Threat <- inner_join(Species_GFBI, IUCN_Data, by=c("species_name"="scientificName")) #X unique species, which is X% of the species from GFBI
+names(GFBI_Threat)
+
+#Filtering out Data deficient and least concern
+Select_threat <- GFBI_Threat[which(GFBI_Threat$redlistCategory == "Endangered" | 
+                                     GFBI_Threat$redlistCategory == "Vulnerable" | GFBI_Threat$redlistCategory == "Critically Endangered"),] #420 species #GFBI_Threat$redlistCategory == "Near Threatened" | 
+
+###To do: re-arrange stress names to seperate categories
+Select_threat <- Select_threat[complete.cases(Select_threat$stressName), ] 
+unique(Select_threat$stressName)
+
+Count_Global <- Select_threat %>% group_by(DominanceCategory) %>% mutate(Conversion = str_count(stressName, 'Ecosystem conversion'), Degradation = str_count(stressName, 'Ecosystem degradation'), Mortality = str_count(stressName, 'Species mortality'), Disturbance = str_count(stressName, 'Species disturbance'), Indirect = str_count(stressName, 'Indirect ecosystem effects'), Competition = str_count(stressName, 'Competition'), Mutualism = str_count(stressName, 'Loss of mutualism'), Reproduction = str_count(stressName, 'Reduced reproductive success'), Pollinator = str_count(stressName, 'Loss of pollinator'), Inbreeding = str_count(stressName, 'Inbreeding'), Hybridisation = str_count(stressName, 'Hybridisation'), Other = str_count(stressName, 'Other')) %>% summarise(DegradationPerc = (sum(Degradation)/n())*100, ConversionPerc = (sum(Conversion)/n())*100,  MortalityPerc = (sum(Mortality)/n())*100, DisturbancePerc = (sum(Disturbance)/n())*100, IndirectPerc = (sum(Indirect)/n())*100, ReproductionPerc = (sum(Reproduction)/n())*100, CompetitionPerc = (sum(Competition)/n())*100, MutualismPerc = (sum(Mutualism)/n())*100, InbreedingPerc = (sum(Inbreeding)/n())*100, HybridisationPerc = (sum(Hybridisation)/n())*100, PollinatorPerc = (sum(Pollinator)/n())*100,   OtherPerc = (sum(Other)/n())*100) %>% as.data.frame()
+
+row.names(Count_Global) <- Count_Global[,1]
+Count_Global_table <- as.data.frame(t(Count_Global[,2:13]))
+Count_Global_table <- round(Count_Global_table,2) 
+
+setwd("~/Documents/PhD projects/Map of evenness")
+fwrite(Count_Global, file="Results_threatGlobally.csv")
+
+####Check if there is a significant difference in threats between dominant and rare species 
+Count_Threats <- Select_threat %>% group_by(DominanceCategory) %>% summarise(Conversion = sum(str_count(stressName, 'Ecosystem conversion')), Degradation = sum(str_count(stressName, 'Ecosystem degradation')), Mortality = sum(str_count(stressName, 'Species mortality')), Disturbance = sum(str_count(stressName, 'Species disturbance')), Indirect = sum(str_count(stressName, 'Indirect ecosystem effects'))) %>% as.data.frame()
+
+tCount_Threats <- as.data.frame(t(Count_Threats))
+tCount_Threats <- tCount_Threats[-1,]
+setnames(tCount_Threats, old=c("V1", "V2"), new=c("dominant", "rare"))
+tCount_Threats$dominant <- as.numeric(tCount_Threats$dominant)
+tCount_Threats$rare <- as.numeric(tCount_Threats$rare)
+  
+fisher.test(tCount_Threats, simulate.p.value=TRUE) #Null hypothesis: no association #2 sided test simulated p-value (2000 replicates) p<0.001 there is a difference between rows and columns 
+
+###Stacked bargraph
+setnames(Count_Global, old = c("ConversionPerc", "DegradationPerc", "MortalityPerc", "DisturbancePerc", "IndirectPerc"), new = c("Conversion", "Degradation", "Sp Mortality", "Sp Disturbance", "Indirect"))
+
+Count_Global_spread <- as.data.frame(pivot_longer(Count_Global, cols=2:6))
+setnames(Count_Global_spread, old = c("name", "value"), new = c("Threat", "Percentage"))
+
+Global_threats <-  ggplot(data = Count_Global_spread, aes(y = Percentage, x = factor(DominanceCategory), fill=Threat)) + 
+  geom_bar(stat="identity", position = "fill") + scale_fill_manual(values=c ("#647fed", "#0911ab", "#76bd60", "#ebd934", "#eb9234")) + 
+  ylab("Threat (%)") + ggtitle('Threat category') + scale_y_continuous(labels = function(l) {trans = l * 100 }) + scale_x_discrete(breaks=c("dominant", "rare"),labels= c("Dominant sp", "Rare sp")) + coord_cartesian(ylim=c(0, 1)) +
+  geom_label(aes(x = DominanceCategory, y = Percentage/157, label = Threat, fontface = "bold"), position = position_stack(vjust = .5), size = 5, colour = "white", show.legend = FALSE) +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold")) 
+
+###EOO dominant and rare species
+# Range <- read.xlsx("~/Documents/PhD projects/Map of evenness/IUCN Data/IUCN_Species range.xlsx", 1)
+# Range <- as.data.frame(Range)
+# Range_Select <- subset(Range, select = -c(Biome, Category))
+# Range_Select <- Range_Select %>% group_by(Species) %>% slice(1)
+# Range_Assesment <- left_join(Select_Assessment, Range_Select, by=c("species_name"="Species"), all.x=TRUE)
+# fwrite(Range_Assesment, file="Range_Assesment_11-08-2021.csv")
+
+Range_final <- fread("~/Documents/PhD projects/Map of evenness/Range_Assesment_11-08-2021.csv")
+Select_Assessment_sp <- Select_Assessment %>% select(species_name, DominanceCategory)
+
+Range_final_unique <- Range_final %>% distinct(species_name, .keep_all = TRUE) %>% select(-DominanceCategory) %>% as.data.frame()
+Range_Assessment <- left_join(Select_Assessment_sp, Range_final_unique, by="species_name") %>% as.data.frame()
+
+Range_Assessment$EOO.km2. <- as.numeric(Range_Assessment$EOO.km2.)
+Range_EOO <- Range_Assessment[which(Range_Assessment$EOO.km2.> 0),] #Range_EOO <- as.data.frame(RangeCompleteEOO[which(RangeCompleteEOO$EOO.km2.!="Unknown"),])
+
+###Difference bwteen EOO dom/rare species by biome
+Range_EOO$EOO.km2. <- as.numeric(as.character(Range_EOO$EOO.km2.))
+Range_EOO$logEOO <- log(Range_EOO$EOO.km2.)
+
+Range_EOO_Select <- Range_EOO[which(!Range_EOO$Biome == 3 & !Range_EOO$Biome == 5),] #Biome 6 has not enough datapoints
+Results_Test <- Range_EOO_Select %>% group_by(Biome) %>% summarise(Pvalue_tTest = t.test(logEOO ~ DominanceCategory)$p.value) %>% as.data.frame()
+#   Biome Pvalue_tTest
+# 1     1 0.044
+# 2     2 0.046
+# 4     4 0.47
+
+ScaledEOO <- Range_EOO %>% group_by(Biome) %>% mutate_at(vars(EOO.km2.), scale) 
+MeanEOO <- ScaledEOO %>% group_by(Biome, DominanceCategory) %>% summarise(n = n(), Mean=mean(EOO.km2.), se=(sd(EOO.km2.)/sqrt(n))) %>% as.data.frame()
+
+###Graph EOO
+RangeBiomes <- ggplot(data=MeanEOO, aes(y=factor(Biome), x=Mean, colour=DominanceCategory)) + geom_point(size=4) +
+  geom_errorbar(aes(xmin=Mean-se, xmax=Mean+se), position = position_dodge(1), color="black", width=.1) +
+  scale_color_manual(breaks = c("dominant", "rare"), values=c("black", "deepskyblue")) +
+  geom_vline(xintercept = 0, linetype="dotted", color = "grey", size=1.5) +
+  theme_classic() + ggtitle("Species range") +  xlab("Scaled EOO") + #xlim(-0.5,0.5) + #ylab("Altitude (m)") +
+  scale_y_discrete(limits=rev, labels=c("Temp conifer", "Temperate", "Tropical conifer", "Tropical dry", "Tropical moist")) + #"Temperate Conifer", "Temperate", "Tropical Conifer", "Tropical dry", "Tropical moist"
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 14, face="bold"),
+        axis.text.x = element_text(size = 14),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 16))
+
+grid.arrange(Global_RedlistPerc, Global_threats, Global_PopulationTrend, RangeBiomes) #, Glob_landuse
+
+######
+#Assesment results
+Results_Assessment <- Select_Assessment %>% group_by(Biome, DominanceCategory, redlistCategory) %>% summarise(n = n()) %>% as.data.frame() #%>% mutate(Perc = (n/sum(n))*100)
+
+#Graph SI 5A
+Results_Assessment$redlistCategory <- factor(Results_Assessment$redlistCategory,levels = c("Near Threatened", "Vulnerable", "Endangered", "Critically Endangered"))
+Dominant_Assessment <- Results_Assessment[which(Results_Assessment$DominanceCategory == "dominant"),]
+Rare_Assessment <- Results_Assessment[which(Results_Assessment$DominanceCategory == "rare"),]
+Dominant_Assessment$Join <- paste(Dominant_Assessment$redlistCategory, "-", Dominant_Assessment$Biome)
+
+Graph_DomAssessment <- ggplot(Dominant_Assessment, aes(x = factor(redlistCategory), y = n, fill = factor(Biome), group = factor(Biome)))+
+  geom_bar(stat = "identity")+ coord_polar(theta="y") + theme_minimal() + ggtitle("Population status Dominant species") + 
+  scale_fill_manual(values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a",  "#025914", "#473901"), name = "Forest biome", labels = c("Tropical moist", "Tropical dry", "Tropical conifer", "Temperate", "Temperate conifer", "Boreal")) +
+  theme(legend.position = "none",
+        plot.title = element_text(color="black", size=16, face="bold", hjust = 0.5),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.x=element_text(color="grey", hjust=0.5,family="sans", size=12),
+        axis.text.y=element_blank())
+
+Graph_RareAssessment <- ggplot(Rare_Assessment, aes(x = factor(redlistCategory), y = n, fill = factor(Biome), group = factor(Biome)))+
+  geom_bar(stat = "identity")+ coord_polar(theta="y") + theme_minimal() + ggtitle("Population status Rare species") + 
+  scale_fill_manual(values=c("#6edefa", "#0e94ed", "#0c1bc4", "#11910a",  "#025914", "#473901"), name = "Forest biome", labels = c("Tropical moist", "Tropical dry", "Tropical conifer", "Temperate", "Temperate conifer", "Boreal")) +
+  theme(legend.position = "right",
+        legend.title = element_text(color="black", family="sans", face="bold", size=16),
+        legend.text = element_text(color="#8c8c8c", family="sans", size=16),
+        plot.title = element_text(color="black", size=16, face="bold", hjust = 0.5),
+        axis.title.x=element_blank(),
+        axis.title.y=element_blank(),
+        axis.text.x=element_text(color="grey", hjust=0.5,family="sans", size=12),
+        axis.text.y=element_blank())
+
+grid.arrange(Graph_DomAssessment, Graph_RareAssessment, layout_matrix = matrix(c(1,1,1,1,1,2,2,2,2,2,2,2,2), nrow=1))
+
+###Specific land-use
+Results_threat <- Select_threat %>% group_by(DominanceCategory, name) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% arrange(Perc) %>% as.data.frame()
+
+setwd("~/Documents/PhD projects/Map of evenness")
+fwrite(Results_threat, file="Results_threatSpecifiedGlobally.csv")
+
+setwd("~/Documents/PhD projects/Map of evenness")
+Global_landuse <- fread("Results_threatSpecifiedGlobally.csv")
+
+names(Global_landuse)
+Global_landuseComplete <- Global_landuse[complete.cases(Global_landuse$LandUse),]
+Global_LandUse_Calc <- Global_landuseComplete %>% group_by(DominanceCategory, LandUse) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% arrange(Perc) %>% as.data.frame()
+
+Global_LandUse_Calc <- Global_landuseComplete %>% group_by(DominanceCategory, LandUse) %>% summarise(Perc = sum(Perc)) %>% arrange(Perc) %>% as.data.frame()
+
+Global_landuseSelect <- Global_LandUse_Calc %>% group_by(DominanceCategory) %>% arrange(desc(Perc)) %>% slice(1:5) %>% as.data.frame() #filter top 5 threat out
+
+setwd("~/Documents/PhD projects/Map of evenness")
+Global_landuseSelect <- fread("Global_landuseSelect.csv")
+
+Global_landuseDom <- Global_landuseSelect[which(Global_landuseSelect$DominanceCategory == "dominant"),]
+Global_landuseRare <- Global_landuseSelect[which(Global_landuseSelect$DominanceCategory == "rare"),]
+
+Global_landuseSelect$LandUse <- factor(Global_landuseSelect$LandUse, levels=unique(Global_landuseSelect$LandUse), ordered=TRUE)
+Glob_landuse <-  ggplot(data = Global_landuseSelect, aes(y = Perc, x = factor(DominanceCategory), fill=reorder(LandUse, -Perc))) + 
+  geom_bar(stat="identity", position = "fill") + scale_fill_manual(values=c ("#647fed", "#0911ab", "#76bd60","#ebd934", "#eb9234", "#ebd934")) + 
+  ylab("Land-use (%)") + ggtitle('Land-use category') + scale_y_continuous(labels = function(l) {trans = l * 100 }, breaks = c(0,0.25,0.50,0.75,1)) + scale_x_discrete(breaks=c("dominant", "rare"),labels= c("Dominant sp", "Rare sp")) + 
+  geom_label(aes(x = DominanceCategory, y = Perc/45, label = LandUse, fontface = "bold"), position = position_stack(vjust = .5), size = 5, colour = "white", show.legend = FALSE) + 
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_text(size = 16, face = "bold"),
+                          axis.title.y = element_blank(),
+                          axis.text.y = element_text(size = 14, face = "bold")) + coord_flip()
+
+```
+###BGCI Analysis
+```{r BGCI}
+########Graphs appendix
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/Species_DRI_09-08-2022.csv") #DR sp are most/least 10% BA
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/Species_DRI_Monodominant_10-08-2022.csv") #Dominant sp is single most dominant sp based on BA
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/SpeciesStems_DRI_10-08-2022.csv") #DR based on stems
+Assessment <- fread("~/Documents/PhD projects/Map of evenness/IUCN Data/assessments.csv") #Load IUCN Data
+
+###Threats graphs for Appendix 
+BGCI <- fread("~/Documents/PhD projects/Map of evenness/BGCI.csv")
+GFBI_BGCI <- left_join(Species_GFBI, BGCI, by=c("species_name"="Check_TaxonName"))
+
+GFBI_BGCI_NoNA <- GFBI_BGCI[complete.cases(GFBI_BGCI[ ,c('InterpretedAssessment')]), ]  
+GFBI_BGCI_Assessment_Check <- GFBI_BGCI_NoNA %>% group_by(Biome, species_name) %>% slice(1) #340 dominant, 6564 rare
+
+GFBI_BGCI_Threatened <- GFBI_BGCI_Assessment_Check %>% group_by(Biome, DominanceCategory, InterpretedAssessment) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% as.data.frame()
+
+Select_Assessment <- as.data.frame(GFBI_BGCI_Assessment_Check[which(GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Not Threatened" | GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Possibly Threatened" | GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Threatened"),]) #341 species #34 dominant (11%), 307 rare species (8%)
+
+GFBI_BGCI_Threatened <- Select_Assessment %>% group_by(DominanceCategory, InterpretedAssessment) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% as.data.frame()
+
+###Graph at-risk species
+GFBI_BGCI_Threatened_select <- GFBI_BGCI_Threatened[ which(GFBI_BGCI_Threatened$InterpretedAssessment=="Threatened"| GFBI_BGCI_Threatened$InterpretedAssessment=="Possibly Threatened"), ] 
+
+BGCI_Perc <-  ggplot(data = GFBI_BGCI_Threatened_select, aes(y = Perc, x = factor(DominanceCategory), fill=factor(InterpretedAssessment))) + 
+  geom_bar(stat="identity", position = "stack") + scale_fill_manual(values=c ("#850000", "#e33030", "#ffa8a8")) + #ylim(c(0,1)) + #"#a81616",
+  ylab("Species globally (%)") + ggtitle('Conservation status') + scale_x_discrete(breaks=c("dominant", "Intermediate", "rare"),labels= c("Dominant sp", "Int sp", "Rare sp")) + #scale_y_continuous(labels = function(l) {trans = l * 100 }) + 
+  geom_label(aes(x = DominanceCategory, y = Perc, label = InterpretedAssessment, fontface = "bold"), position = position_stack(vjust = .5), size = 5, colour = "white", show.legend = FALSE) +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold"))
+
+###Endemism graphs for Appendix 
+###Analysis endemics
+Select_endemic <- as.data.frame(GFBI_BGCI_Assessment_Check[which(GFBI_BGCI_Assessment_Check$Endemism == "yes"| GFBI_BGCI_Assessment_Check$Endemism == "no"),]) # 
+GFBI_BGCI_endemic_all <- Select_endemic %>% group_by(DominanceCategory, Endemism) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% arrange(Perc) %>% as.data.frame()
+
+Select_endemic_threatened <- Select_endemic[ which(Select_endemic$InterpretedAssessment=="Threatened"), ] 
+GFBI_BGCI_endemic <- Select_endemic_threatened %>% group_by(DominanceCategory, Endemism) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% as.data.frame() #arrange(Perc) %>% 
+#Threatened species:36% dominant species and 41% rare species endemic
+#All species: 25% dominant species and 27% rare species endemic
+
+# ###Statistics endemics
+# Endemic_stats <- Select_endemic_threatened %>% group_by(DominanceCategory, Endemism) %>% summarise(n = n()) %>% as.data.frame()
+# dominant <- c(23, 13)
+# rare <- c(541, 388)
+# Table_endemic <- data.frame(dominant, rare)
+# fisher.test(Table_endemic, simulate.p.value=TRUE) #p-value = 0.6059 (rows-columns are the same)
+
+###Graph endemics
+GFBI_BGCI_endemic_graph <- as.data.frame(GFBI_BGCI_endemic[which(GFBI_BGCI_endemic$Endemism=="yes"),])
+                                         
+Graph_endemics <-  ggplot(data = GFBI_BGCI_endemic_graph, aes(y = Perc, x = factor(DominanceCategory))) + geom_bar(stat="identity", fill="#6600ff") + 
+  ylab("Threatened species (%)") + ggtitle('Endemism') + scale_x_discrete(breaks=c("dominant", "Intermediate", "rare"),labels= c("Dominant sp", "Int sp", "Rare sp")) + 
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold")) 
+
+GFBI_BGCI_endemic_graph <- as.data.frame(GFBI_BGCI_endemic_all[which(GFBI_BGCI_endemic_all$Endemism=="yes"),])
+
+Graph_endemics_all <-  ggplot(data = GFBI_BGCI_endemic_graph, aes(y = Perc, x = factor(DominanceCategory))) + geom_bar(stat="identity", fill="#6600ff") + 
+  ylab("Species (%)") + ggtitle('Endemism') + scale_x_discrete(breaks=c("dominant", "Intermediate", "rare"),labels= c("Dominant sp", "Int sp", "Rare sp")) + 
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold")) 
+
+###Evaluate if endemics are more prone to extinction
+Select_endemic_subset <- Select_endemic[!(Select_endemic$InterpretedAssessment==""),]
+Select_endemic_subset <- Select_endemic_subset %>% distinct(species_name, .keep_all = TRUE)
+GFBI_endemics_evaluate <- Select_endemic_subset %>% group_by(Endemism, InterpretedAssessment) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% arrange(Perc) %>% as.data.frame()
+
+Endemism_Threatened <-  ggplot(data = GFBI_endemics_evaluate, aes(y = Perc, x = factor(Endemism), fill=factor(InterpretedAssessment))) + 
+  geom_bar(stat="identity", position = "stack") + scale_fill_manual(values=c ("#850000", "#e33030", "#ffa8a8", "#850000", "#e33030", "#ffa8a8", "#ffa8a8")) + #ylim(c(0,1)) + #"#a81616",
+  ylab("Species globally (%)") + ggtitle('Conservation status') + scale_x_discrete(breaks=c("yes", "no"),labels= c("Endemic", "Not endemic")) + #scale_y_continuous(labels = function(l) {trans = l * 100 }) + 
+  geom_label(aes(x = Endemism, y = Perc, label = InterpretedAssessment, fontface = "bold"), position = position_stack(vjust = .5), size = 5, colour = "white", show.legend = FALSE) +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold"))
+
+
+###BA
+setwd("~/Documents/PhD projects/Map of evenness/")
+BGCI <- fread("~/Documents/PhD projects/Map of evenness/BGCI.csv")
+Species_GFBI <- fread("~/Documents/PhD projects/Map of evenness/Species_DRI_09-08-2022.csv") 
+
+GFBI_BGCI <- left_join(Species_GFBI, BGCI, by=c("species_name"="Check_TaxonName")) 
+
+GFBI_BGCI_NoNA <- GFBI_BGCI[complete.cases(GFBI_BGCI[ ,c('InterpretedAssessment')]), ]  
+GFBI_BGCI_Assessment_Check <- GFBI_BGCI_NoNA %>% group_by(Biome, species_name) %>% slice(1) #371 dominant, 7815 rare
+
+GFBI_BGCI_Threatened <- GFBI_BGCI_Assessment_Check %>% group_by(Biome, DominanceCategory, InterpretedAssessment) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% arrange(Perc) %>% as.data.frame()
+
+Select_Assessment <- as.data.frame(GFBI_BGCI_Assessment_Check[which(GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Not Threatened" | GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Possibly Threatened" | GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Threatened"),]) #341 species #34 dominant (11%), 307 rare species (8%)
+
+GFBI_BGCI_Threatened <- Select_Assessment %>% group_by(DominanceCategory, InterpretedAssessment) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% as.data.frame()
+#In general: 11% dominant species and 16% rare species threatened, 5% dominant species and 7% rare species possibly threatened
+
+###Statistics population status Globally
+Select_Assessment_stats <- as.data.frame(GFBI_BGCI_Assessment_Check[which(GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Possibly Threatened" | GFBI_BGCI_Assessment_Check$InterpretedAssessment == "Threatened"),])
+
+Threatened_stats <- Select_Assessment_stats %>% group_by(Biome, DominanceCategory, InterpretedAssessment) %>% summarise(n = n()) %>% as.data.frame()
+dominant <- c(0, 0)
+Intermediate <- c(1, 1)
+rare <- c(1, 2)
+Table_threatened <- data.frame(dominant, Intermediate, rare)
+fisher.test(Table_threatened, simulate.p.value=TRUE) #p-value = 0.8798 D-R #0.4753 D-I-R #0.8716 D-I-R B1 #0.0004998 D-I-R B2 #0.3428 B3 #0.5872 B4 #0.3458 B5 #0.2219 B6
+
+###Statistics population status per biome
+NotThreatened_Assessment <- as.data.frame(GFBI_BGCI_NoNA[which(GFBI_BGCI_NoNA$InterpretedAssessment == "Not Threatened"),])
+NotThreatened_Assessment$Threatened <- 0
+Threatened_Assessment <- as.data.frame(GFBI_BGCI_NoNA[which(GFBI_BGCI_NoNA$InterpretedAssessment == "Threatened" | GFBI_BGCI_NoNA$InterpretedAssessment == "Possibly Threatened"),])
+Threatened_Assessment$Threatened <- 1
+Difference_Assessment <- rbind(NotThreatened_Assessment, Threatened_Assessment) #, PossiblyThreatened_Assessment
+
+Poisson_glm <- glm(Threatened  ~ Biome * DominanceCategory, family = poisson(link = "log"), data=Difference_Assessment) #no significant difference between biomes and dominance categories (p=0.23) #Significant different between biomes when intermediate species are incorporated
+summary(Poisson_glm)
+
+###Graph at-risk species
+GFBI_BGCI_Threatened_select <- GFBI_BGCI_Threatened[ which(GFBI_BGCI_Threatened$InterpretedAssessment=="Threatened"| GFBI_BGCI_Threatened$InterpretedAssessment=="Possibly Threatened"), ] 
+GFBI_BGCI_Threatened_selectDR <- GFBI_BGCI_Threatened_select[ which(GFBI_BGCI_Threatened_select$DominanceCategory=="dominant"| GFBI_BGCI_Threatened_select$DominanceCategory=="rare"), ] 
+GFBI_BGCI_Threatened_selectDR <- as.data.frame(GFBI_BGCI_Threatened_selectDR)
+  
+BGCI_Perc <-  ggplot(data = GFBI_BGCI_Threatened_selectDR, aes(y = Perc, x = factor(DominanceCategory), fill=factor(InterpretedAssessment))) + 
+  geom_bar(stat="identity", position = "stack") + scale_fill_manual(values=c ("#850000", "#e33030", "#ffa8a8")) + #ylim(c(0,1)) + #"#a81616",
+  ylab("Species globally (%)") + ggtitle('Conservation status') + scale_x_discrete(breaks=c("dominant", "rare"),labels= c("Dominant sp", "Rare sp")) + #scale_y_continuous(labels = function(l) {trans = l * 100 }) + 
+  geom_label(aes(x = DominanceCategory, y = Perc, label = InterpretedAssessment, fontface = "bold"), position = position_stack(vjust = .5), size = 5, colour = "white", show.legend = FALSE) +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold")) ###Figure 5
+
+###Analysis endemics
+Select_endemic <- as.data.frame(GFBI_BGCI_Assessment_Check[which(GFBI_BGCI_Assessment_Check$Endemism == "yes"| GFBI_BGCI_Assessment_Check$Endemism == "no"),]) # 
+GFBI_BGCI_endemic_all <- Select_endemic %>% group_by(DominanceCategory, Endemism) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% arrange(Perc) %>% as.data.frame()
+
+Select_endemic_threatened <- Select_endemic[ which(Select_endemic$InterpretedAssessment=="Threatened"), ] 
+GFBI_BGCI_endemic <- Select_endemic_threatened %>% group_by(Biome, DominanceCategory, Endemism) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% as.data.frame() #arrange(Perc) %>% 
+#Threatened species:36% dominant species and 41% rare species endemic
+#All species: 25% dominant species and 27% rare species endemic
+
+###Statistics endemics
+Endemic_stats <- Select_endemic_threatened %>% group_by(DominanceCategory, Endemism) %>% summarise(n = n()) %>% as.data.frame()
+dominant <- c(23, 13)
+rare <- c(541, 388)
+Table_endemic <- data.frame(dominant, rare)
+fisher.test(Table_endemic, simulate.p.value=TRUE) #p-value = 0.6059 (rows-columns are the same)
+
+###Graph endemics
+GFBI_BGCI_endemic_graph <- as.data.frame(GFBI_BGCI_endemic[which(GFBI_BGCI_endemic$Endemism=="yes"),])
+                                         
+GFBI_BGCI_endemic_graphDR <- GFBI_BGCI_endemic_graph[ which(GFBI_BGCI_endemic_graph$DominanceCategory=="dominant"| GFBI_BGCI_endemic_graph$DominanceCategory=="rare"), ] 
+Graph_endemics <-  ggplot(data = GFBI_BGCI_endemic_graphDR, aes(y = Perc, x = factor(DominanceCategory))) + geom_bar(stat="identity", fill="#4745bf") + 
+  ylab("Threatened species (%)") + ggtitle('Endemism') + scale_x_discrete(breaks=c("dominant", "rare"),labels= c("Dominant sp", "Rare sp")) + 
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold")) ###Figure 5
+
+###EOO Analysis
+EOO_BGCI <- read.xlsx("~/Documents/PhD projects/Map of evenness/Data_Lalasia050122-EOO.xlsx", 1) 
+EOO_BGCI <- EOO_BGCI %>% dplyr::select("species_name", "EOO")
+
+EOO_Int <- fread("~/Documents/PhD projects/Map of evenness/GFBI_Intermediate species.csv")
+setnames(EOO_Int, "EOO(TreeLeast)", "EOO")
+
+EOO <- rbind(EOO_BGCI, EOO_Int)
+
+EOO_GFBI <- left_join(GFBI_BGCI_NoNA, EOO_BGCI, by="species_name")
+EOO_GFBI <- EOO_GFBI[complete.cases(EOO_GFBI$EOO),]
+EOO_GFBI <- as.data.frame(EOO_GFBI[which(EOO_GFBI$EOO > 0),])
+
+EOO_GFBI_threatened <-  as.data.frame(EOO_GFBI[which(EOO_GFBI$InterpretedAssessment == "Threatened"),]) 
+
+###Statistics EOO
+EOO_Select <- EOO_GFBI_threatened[which(!EOO_GFBI_threatened$Biome == 3 & !EOO_GFBI_threatened$Biome == 6),] 
+Results_tTest_EOO <- EOO_Select %>% group_by(Biome) %>% summarise(Pvalue_tTest = t.test(EOO ~ DominanceCategory)$p.value) %>% as.data.frame()
+
+###Compare EOO dominant and rare species to global EOO
+# Here are stats for all EOO is in dataset (n=48485):
+# Average: 1356913
+# Median: 117208.7
+# Upper Quantile: 1050518
+# Lower Quantile: 1446.19
+
+EOO_GFBI <- left_join(Species_GFBI, EOO_BGCI, by="species_name")
+EOO_GFBI <- EOO_GFBI[complete.cases(EOO_GFBI$EOO),]
+EOO_GFBI <- as.data.frame(EOO_GFBI[which(EOO_GFBI$EOO > 0),])
+
+x=EOO_GFBI[ which(EOO_GFBI$Biome == 6 & EOO_GFBI$DominanceCategory == "dominant"), ]
+
+t.test(log(x$EOO), mu = log(1356913))
+
+summariseEOO <- EOO_GFBI %>% group_by(Biome, DominanceCategory) %>% summarise(Mean=mean(EOO))
+
+#Biome 1: Dominant p-value = 0.001087 (larger) Rare p-value < 2.2e-16 (larger)
+#Biome 2: Dominant p-value = 0.0002968 (larger) Rare p-value = 2.946e-11 (larger)
+#Biome 3: Dominant p-value = 0.6135 (smaller, not significant) Rare p-value = 0.3495 (smaller, not significant)
+#Biome 4: Dominant p-value = 8.901e-11 (larger) Rare p-value = 2.414e-08 (larger)
+#Biome 5: Dominant p-value = 3.754e-10 (larger) Rare p-value = 1.829e-13 (larger)
+#Biome 6: Dominant p-value = 0.2338 (larger, not significant) Rare p-value = 4.439e-08 (larger)
+
+###Global Graph EOO
+Mean_Global <- EOO_GFBI_threatened %>% group_by(DominanceCategory) %>% summarise(meanEOO = mean(EOO), sdEOO=sd(EOO), se=std.error(EOO), N=n()) %>% as.data.frame()
+Mean_GlobalDR <- EOO_GFBI_threatened[ which(EOO_GFBI_threatened$DominanceCategory=="dominant"| EOO_GFBI_threatened$DominanceCategory=="rare"), ] 
+  
+EOO_BGCI_Graph_Global <- ggplot(data=Mean_GlobalDR, aes(y=EOO, x=DominanceCategory, colour=DominanceCategory)) + geom_boxplot(fill="#a545bf", colour="black") +
+  scale_y_continuous(labels = function(l) {trans = l / 100000 }, limits=c(0,15000000)) + 
+  theme_classic() + ggtitle("Threatened species range") +  ylab("EOO (1000 ha)") + scale_x_discrete(breaks=c("dominant", "rare"),labels= c("Dominant sp", "Rare sp")) + 
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold"))###Figure 5
+
+###Graph EOO
+Mean_Biome <- EOO_GFBI_threatened %>% group_by(Biome, DominanceCategory) %>% summarise(meanEOO = mean(EOO), sdEOO=sd(EOO), se=std.error(EOO), N=n()) %>% as.data.frame()
+
+EOO_BGCI_Graph <- ggplot(data=Mean_Biome, aes(y=factor(Biome), x=meanEOO, colour=DominanceCategory)) + geom_boxplot() +
+  geom_errorbar(aes(xmin=meanEOO-se, xmax=meanEOO+se), position = position_dodge(1), color="black", width=.1) +
+  scale_color_manual(breaks = c("dominant", "Intermediate", "rare"), values=c("black", "grey", "deepskyblue")) + 
+  #geom_vline(xintercept = 0, linetype="dotted", color = "grey", size=1.5) +
+  scale_x_continuous(labels = function(l) {trans = l / 100000 }) + 
+  theme_classic() + ggtitle("Threatened species range") +  xlab("EOO (1000 ha)") + #xlim(-0.5,0.5) + #ylab("Altitude (m)") +
+  scale_y_discrete(limits=rev, labels=c("Boreal", "Temperate Conifer", "Temperate", "Tropical conifer", "Tropical dry", "Tropical moist")) + 
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 14, face="bold"),
+        axis.text.x = element_text(size = 14),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 16))
+
+###Graph EOO
+Mean_Biome <- EOO_GFBI %>% group_by(Biome, DominanceCategory) %>% summarise(meanEOO = mean(EOO), sdEOO=sd(EOO), se=std.error(EOO), N=n()) %>% as.data.frame()
+
+EOO_BGCI_NotThreatened <- ggplot(data=Mean_Biome, aes(y=factor(Biome), x=meanEOO, colour=DominanceCategory)) + geom_point(size=4) +
+  geom_errorbar(aes(xmin=meanEOO-se, xmax=meanEOO+se), position = position_dodge(1), color="black", width=.1) +
+  scale_color_manual(breaks = c("dominant", "Intermediate", "rare"), values=c("black", "grey", "deepskyblue")) + 
+  #geom_vline(xintercept = 0, linetype="dotted", color = "grey", size=1.5) +
+  scale_x_continuous(labels = function(l) {trans = l / 100000 }) + 
+  theme_classic() + ggtitle("Species range") +  xlab("EOO (1000 ha)") + #xlim(-0.5,0.5) + #ylab("Altitude (m)") +
+  scale_y_discrete(limits=rev, labels=c("Boreal", "Temperate Conifer", "Temperate", "Tropical conifer", "Tropical dry", "Tropical moist")) + 
+  theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 14, face="bold"),
+        axis.text.x = element_text(size = 14),
+        axis.title.y = element_blank(),
+        axis.text.y = element_text(size = 16))
+
+layout=rbind(c(1,1,2,2,3,3,3))
+grid.arrange(BGCI_Perc, Graph_endemics, EOO_BGCI_Graph, layout_matrix=layout, nrow=1) 
+
+###Evaluate if species with low EOO are more prone to extinction
+EOO_GFBI_subset <- EOO_GFBI[!(EOO_GFBI$InterpretedAssessment==""),]
+EOO_GFBI_subset <- EOO_GFBI_subset %>% distinct(species_name, .keep_all = TRUE)
+EOO_GFBI_subset$SmallEOO <- ifelse(EOO_GFBI_subset$EOO <= 396276, "yes", "no")
+
+GFBI_EOO_evaluate <- EOO_GFBI_subset %>% group_by(SmallEOO, InterpretedAssessment) %>% summarise(n = n()) %>% mutate(Perc = (n/sum(n))*100) %>% arrange(Perc) %>% as.data.frame()
+
+EOO_Threatened <-  ggplot(data = GFBI_EOO_evaluate, aes(y = Perc, x = factor(SmallEOO), fill=factor(InterpretedAssessment))) + 
+  geom_bar(stat="identity", position = "stack") + scale_fill_manual(values=c ("#850000", "#e33030", "#ffa8a8", "#850000", "#e33030", "#ffa8a8", "#ffa8a8")) + #ylim(c(0,1)) + #"#a81616",
+  ylab("Species globally (%)") + ggtitle('Conservation status') + scale_x_discrete(breaks=c("yes", "no"),labels= c("Small range", "Large range")) + #scale_y_continuous(labels = function(l) {trans = l * 100 }) + 
+  geom_label(aes(x = SmallEOO, y = Perc, label = InterpretedAssessment, fontface = "bold"), position = position_stack(vjust = .5), size = 5, colour = "white", show.legend = FALSE) +
+  theme_classic() + theme(plot.title = element_text(hjust = 0.5, size = 20, face = "bold"),
+                          legend.position = "none",
+                          axis.text.x = element_text(size = 14, face = "bold", color ="black"),
+                          axis.title.x = element_blank(),
+                          axis.title.y = element_text(size = 16, face = "bold"),
+                          axis.text.y = element_text(size = 14, face = "bold"))
+
+```
+###Figure 5
+```{r Fig5}
+margin = theme(plot.margin = unit(c(0.25,0.25,0.25,0.25), "cm"))
+grid.arrange(grobs = list(BGCI_Perc, Global_PopulationTrend,  Graph_endemics, EOO_BGCI_Graph_Global), nrow=2, ncol=2)
+
+```
+###Figure S10 (plot sizes)
+```{r FigS10}
+summary(GFBI_Plotsize$Plotsize)
+PlotsizeLargerha <- GFBI_Plotsize[which(GFBI_Plotsize$Plotsize > 0.99),]
+
+GFBI_Plotsize <- GFBI_Plotsize[order(GFBI_Plotsize$Biome),]
+
+PlotSize <- ggplot(data=GFBI_Plotsize, aes(x=factor(Biome), y=Plotsize, colour=factor(Biome))) + geom_boxplot(fill = "lightgrey") + 
+  scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + stat_boxplot(geom = 'errorbar') + theme_classic() + ggtitle("Plotsize by biome") + ylab("Plotsize (ha)") + xlab("Biomes") +
+  theme(plot.title = element_text(color="black", size=15, face="bold", hjust = 0.5),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_blank(),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15)) 
+
+PlotSizeRichnessGlobal <- ggplot(data=GFBI_Plotsize, aes(x=Plotsize, y=log(S), colour=factor(Biome))) + geom_point(alpha=0.01) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + geom_smooth(color="black",  method="gam", linewidth=2) +  theme_classic()+  ggtitle("Richness-Plotsize")+ ylab("log(Species richness)") + xlab("Plotsize (ha)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+PlotSizeRichnessBiome <- ggplot(data=GFBI_Plotsize, aes(x=Plotsize, y=log(S), colour=factor(Biome))) + geom_point(alpha=0.1, colour="grey") + geom_smooth(aes(color=factor(Biome)), method="lm", linewidth=2) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + theme_classic() + ggtitle("Plotsize - Richness") + xlab("Plotsize (ha)") + ylab("log(Species richness)") + 
+  theme(plot.title = element_text(color="black", size=15, face="bold", hjust = 0.5),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+PlotSizeDomGlobal <- ggplot(data=GFBI_Plotsize, aes(x=Plotsize, y=BA_perc_sp, colour=factor(Biome))) + geom_point(alpha=0.01) + 
+  scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) +
+  geom_smooth(color="black",  method="gam", linewidth=2) +  theme_classic()+  ggtitle("Dominance-Plotsize")+ ylab("Dominance (%)") + xlab("Plotsize (ha)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+PlotSizeDomBiome <- ggplot(data=GFBI_Plotsize, aes(x=Plotsize, y=BA_perc_sp)) + geom_point(alpha=0.01, colour="grey") + geom_smooth(aes(color=factor(Biome)), method="lm", linewidth=2) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + theme_classic()+  ggtitle("Dominance-Plotsize")+ ylab("Dominance (%)") + xlab("Plotsize (ha)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+PlotSizeRareGlobal <- ggplot(data=GFBI_Plotsize, aes(x=Plotsize, y=Rarity, colour=factor(Biome))) + geom_point(alpha=0.01) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + geom_smooth(color="black",  method="gam", linewidth=2) +  theme_classic()+  ggtitle("Rarity-Plotsize")+ ylab("Rarity (%)") + xlab("Plotsize (ha)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+PlotSizeRareBiome <- ggplot(data=GFBI_Plotsize, aes(x=Plotsize, y=Rarity)) + geom_point(alpha=0.01, colour="grey") + geom_smooth(aes(color=factor(Biome)), method="lm", linewidth=2) + scale_colour_manual(breaks=c("1", "2", "3", "4", "5", "6"), values=c("#473901", "#025914", "#11910a", "#0c1bc4",  "#0e94ed", "#6edefa")) + theme_classic()+  ggtitle("Dominance-Plotsize")+ ylab("Rarity (%)") + xlab("Plotsize (ha)") +
+  theme(plot.title = element_text(hjust = 0.5, size = 15, face = "bold"),
+        legend.position = "none",
+        axis.title.x = element_text(size = 15),
+        axis.text.x = element_text(size = 15),
+        axis.title.y = element_text(size = 15),
+        axis.text.y = element_text(size = 15))
+
+
+grid.arrange(PlotSizeRichnessGlobal, PlotSizeRichnessBiome, PlotSizeDomGlobal, PlotSizeDomBiome, PlotSizeRareGlobal, PlotSizeRareBiome)
+
+
+```
